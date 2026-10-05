@@ -4,7 +4,7 @@ from importlib import util
 
 logger = logging.getLogger(__name__)
 
-REQUIRED_LIBS = ["torch", "fastapi", "surrealdb", "pydantic"]
+REQUIRED_LIBS = ["torch", "fastapi", "surrealdb", "pydantic", "sentence_transformers", "numpy"]
 OPTIONAL_LIBS = ["win32api", "win32con", "win32process"]
 UTILITY_LIBS = ["colorlog"]
 

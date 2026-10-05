@@ -1,133 +1,296 @@
 import asyncio
-import gc
+import json
 import logging
+import mimetypes
 import os
 import sys
-import time
 from contextlib import asynccontextmanager
-from typing import TypeAlias
+from typing import Any
 
-import torch
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel
+from surrealdb import AsyncSurreal, RecordID
+from surrealdb.errors import InvalidRecordIdError
 
 from src.config import Settings, get_settings
-from src.handle_changes import close_live_queries, sub
+from src.state import ServiceState
 from src.utils import check_deps, setup_logging, setup_process_prio
+from src.worker import ModelJob, ModelWorker
 
 setup_logging(logging.INFO)
 check_deps()
 
 logger = logging.getLogger(__name__)
 
-from fastapi import FastAPI
-from surrealdb import (
-    AsyncEmbeddedSurrealConnection,
-    AsyncHttpSurrealConnection,
-    AsyncSurreal,
-    AsyncWsSurrealConnection,
-    Table,
-)
+settings = get_settings()
+state = ServiceState()
+worker = ModelWorker(state)
 
-args = get_settings()
+job_queue: asyncio.Queue[RecordID] = asyncio.Queue()
 
-def init():
-    settings = get_settings()
-    os.environ["HF_HOME"] = settings.hf_home
 
-    # Применяем оптимизации для CPU только в том случае, если CUDA недоступна
-    if settings.device == "cpu":
-        # Ограничиваем количество потоков для CPU
-        os.environ["OMP_NUM_THREADS"] = "4"
-        os.environ["MKL_NUM_THREADS"] = "4"
-
-        # Для Windows: выставляем процессу фоновый приоритет (IDLE), чтобы ПК не тормозил
+def _setup_runtime(s: Settings) -> None:
+    os.environ.setdefault("HF_HOME", s.hf_home)
+    if s.device == "cpu":
+        os.environ.setdefault("OMP_NUM_THREADS", "4")
+        os.environ.setdefault("MKL_NUM_THREADS", "4")
         if sys.platform == "win32":
             setup_process_prio()
 
-HEALTH_STATUS = {
-    "status": "starting",          # starting, idle, processing, error
-    "device_used": get_settings().device,
-    "modalities": get_settings().modalities,
-    "last_seen_db": None,
-    "processed_count": 0,
-    "errors_count": 0,
-    "current_record_id": None,
-    "uptime_start": time.time()
-}
 
-# logger.info(f"Загрузка модели jina-embeddings-v5-omni-nano на устройство [{get_settings().device.upper()}]...")
-# logger.info(f"Выбранные модальности: {get_settings().modalities}")
-# Инициализируем модель на выбранном устройстве
-# model = SentenceTransformer("jinaai/jina-embeddings-v5-omni-nano-retrieval",
-#     device=device,
-#     trust_remote_code=True,
-#     model_kwargs={"modality": args.modalities})
-# logger.info(f"Модель успешно загружена на {get_settings().device.upper()}.")
-HEALTH_STATUS["status"] = "idle"
+def _build_proxy_url(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    if raw.startswith(("http://", "https://")):
+        return raw
+    # SurrealDB file pointer: "bucket:/path" -> our /files proxy.
+    bucket, sep, path = raw.partition(":")
+    if not sep:
+        return raw
+    path = path.lstrip("/")
+    if not bucket or not path:
+        return None
+    return f"http://127.0.0.1:{settings.fastapi_port}/files/{bucket}/{path}"
 
 
-DB: TypeAlias = AsyncEmbeddedSurrealConnection | AsyncWsSurrealConnection | AsyncHttpSurrealConnection
+# Keeping a file pointer embedded in SurrealQL requires only that neither the
+# bucket nor path can break out of the `f"..."` literal. That means no `"`,
+# no backslash, no whitespace/control chars. Everything else is inert inside a
+# string and needs no further character whitelisting.
+def _safe_literal_segment(seg: str) -> bool:
+    if not seg:
+        return False
+    for ch in seg:
+        if ch in ('"', "\\") or ch.isspace() or not ch.isprintable():
+            return False
+    return True
 
-async def connect_db(db: DB, args: Settings):
-    logger.info(f"Попытка подключения к SurrealDB по адресу {args.surrealdb_host}...")
+
+async def _connect_db(s: Settings) -> Any:
+    db = AsyncSurreal(s.surrealdb_host)
+    await db.signin({"username": s.surrealdb_user, "password": s.surrealdb_password})
+    await db.use(namespace=s.surrealdb_namespace, database=s.surrealdb_name)
+    logger.info("Connected to SurrealDB (%s/%s)", s.surrealdb_namespace, s.surrealdb_name)
+    return db
+
+
+async def _read_file_bytes(db: Any, bucket: str, path: str) -> bytes | None:
+    if not _safe_literal_segment(bucket) or "/" in bucket:
+        raise ValueError("invalid bucket name")
+    if not _safe_literal_segment(path):
+        raise ValueError("invalid file path")
+
+    result = await db.query(f'RETURN f"{bucket}:/{path}".get();')
+    if result is None:
+        return None
+    if isinstance(result, bytes):
+        return result
+    raise ValueError(f"unexpected file result: {type(result).__name__}")
+
+
+class Broadcaster:
+    def __init__(self) -> None:
+        self._subs: set[asyncio.Queue] = set()
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue()
+        self._subs.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        self._subs.discard(q)
+
+    def publish(self, data: dict) -> None:
+        for q in list(self._subs):
+            q.put_nowait(data)
+
+
+broadcaster = Broadcaster()
+
+
+def _parse_record_id(raw: str) -> RecordID:
     try:
-        await db.connect()  # pyright: ignore[reportCallIssue]
-        token = await db.signin({"username": args.surrealdb_user, "password": args.surrealdb_password})
-        await db.use(namespace=args.surrealdb_namespace, database=args.surrealdb_name)
-    except Exception as e:
-        logger.error(f"Ошибка подключения к SurrealDB: {e}")
-        raise
-    else:
-        logger.info(f" Успешное подключение к SurrealDB ({args.surrealdb_namespace}/{args.surrealdb_name})")
-        app.state.db = db
-        app.state.token = token
+        return RecordID.parse(raw)
+    except (InvalidRecordIdError, ValueError) as e:
+        raise HTTPException(422, f"invalid record id: {raw}") from e
 
 
-db = AsyncSurreal(args.surrealdb_host+"/rpc")
-tasks: set[asyncio.Task] = set()
-def done_callback(task: asyncio.Task):
-    logger.info(f"Task {task.get_name()} is done")
+async def _dispatch(db: Any) -> None:
+    while True:
+        rid_obj = await job_queue.get()
+        rid = str(rid_obj)
+        state.set_task(rid, "processing")
+        logger.info("Processing %s", rid)
 
-# for now hardcoded
+        try:
+            rec = await db.select(rid_obj)
+            if isinstance(rec, list):
+                rec = rec[0] if rec else None
+        except Exception as e:
+            logger.warning("Failed to select %s: %s", rid, e)
+            state.set_task(rid, "error", str(e))
+            state.bump(ok=False)
+            broadcaster.publish({"record_id": rid, "status": "error", "error": str(e)})
+            continue
+
+        if not rec or not isinstance(rec, dict):
+            state.set_task(rid, "error", "record not found")
+            state.bump(ok=False)
+            broadcaster.publish({"record_id": rid, "status": "error", "error": "record not found"})
+            continue
+
+        text = (rec.get("generated_description") or "").strip() or None
+        image_proxy = _build_proxy_url(rec.get("image_url"))
+
+        if text is None and image_proxy is None:
+            state.set_task(rid, "error", "no text or image to embed")
+            state.bump(ok=False)
+            broadcaster.publish({"record_id": rid, "status": "error", "error": "no text or image to embed"})
+            continue
+
+        worker.jobs.put(ModelJob(record_id=rid, text=text, image_url=image_proxy))
+
+
+async def _persist(db: Any) -> None:
+    while True:
+        result = await asyncio.to_thread(worker.results.get)
+        rid = result.record_id
+
+        if result.error:
+            state.set_task(rid, "error", result.error)
+            state.bump(ok=False)
+            broadcaster.publish({"record_id": rid, "status": "error", "error": result.error})
+            continue
+
+        data: dict[str, Any] = {}
+        if result.text_embedding is not None:
+            data["text_embedding"] = result.text_embedding
+        if result.image_embedding is not None:
+            data["image_embedding"] = result.image_embedding
+
+        try:
+            await db.merge(RecordID.parse(rid), data)
+        except Exception as e:
+            logger.warning("Failed to persist %s: %s", rid, e)
+            state.set_task(rid, "error", str(e))
+            state.bump(ok=False)
+            broadcaster.publish({"record_id": rid, "status": "error", "error": str(e)})
+            continue
+
+        state.set_task(rid, "done")
+        state.bump(ok=True)
+        broadcaster.publish({"record_id": rid, "status": "done"})
+        logger.info("Embedded and saved %s", rid)
+
 
 @asynccontextmanager
-async def lifecycle(app: FastAPI):
-    await connect_db(db, args)
+async def lifespan(app: FastAPI):
+    _setup_runtime(settings)
+    db = await _connect_db(settings)
+    app.state.db = db
 
-    HEALTH_STATUS["last_seen_db"] = time.time()
-    HEALTH_STATUS["status"] = "idle"
-
-
-    uuid = await db.live(Table("embedding_queue"))
-    stream = await sub(db, uuid)  # pyright: ignore[reportArgumentType]
-    if stream is not None:
-        tasks.add(stream)
-        stream.add_done_callback(done_callback)
-    logger.info(f"Создан поток: {stream}")
-
+    worker.start()
+    dispatch_task = asyncio.create_task(_dispatch(db))
+    persist_task = asyncio.create_task(_persist(db))
+    app.state.dispatch_task = dispatch_task
+    app.state.persist_task = persist_task
+    logger.info("Service ready (model loading in background)")
     yield
-    if get_settings().device == "cuda":
-        torch.cuda.empty_cache()
-    await close_live_queries(db, tasks)
-    gc.collect()
+
+    for t in (dispatch_task, persist_task):
+        t.cancel()
+    try:
+        await db.close()
+    except Exception as e:
+        logger.debug("Error closing DB connection: %s", e)
 
 
-app = FastAPI(title="Jina Worker Health Monitor", lifespan=lifecycle)
+app = FastAPI(title="Embedding Service", lifespan=lifespan)
+
+
+class GenerateRequest(BaseModel):
+    items: list[str]
+
+
+@app.post("/generate", status_code=202)
+async def generate(payload: GenerateRequest):
+    if not payload.items:
+        raise HTTPException(400, "items must not be empty")
+
+    accepted: list[str] = []
+    for raw in payload.items:
+        rid_obj = _parse_record_id(raw.strip())
+        rid = str(rid_obj)
+        state.set_task(rid, "queued")
+        await job_queue.put(rid_obj)
+        broadcaster.publish({"record_id": rid, "status": "queued"})
+        accepted.append(rid)
+
+    return {"accepted": accepted, "count": len(accepted)}
+
 
 @app.get("/health")
-async def get_health():
-    uptime = time.time() - HEALTH_STATUS["uptime_start"]
-    db_ok = False
-    if HEALTH_STATUS["last_seen_db"]:
-        db_ok = (time.time() - HEALTH_STATUS["last_seen_db"] < 30)
+async def health():
+    snap = state.snapshot()
     return {
-        "worker_status": HEALTH_STATUS["status"],
-        "device": HEALTH_STATUS["device_used"],
-        "uptime_seconds": int(uptime),
-        "tracked_table": get_settings().surrealdb_name,
+        "worker_status": snap["model"],
+        "model_error": snap["model_error"],
+        "device": settings.device,
+        "modalities": settings.modalities,
+        "uptime_seconds": snap["uptime_seconds"],
         "metrics": {
-            "total_processed": HEALTH_STATUS["processed_count"],
-            "total_errors": HEALTH_STATUS["errors_count"]
+            "total_processed": snap["processed"],
+            "total_errors": snap["errors"],
         },
-        "current_task": HEALTH_STATUS["current_record_id"],
-        "db_connected": db_ok
+        "pending": snap["pending"],
     }
+
+
+@app.get("/tasks")
+async def tasks():
+    return state.all_tasks()
+
+
+@app.get("/tasks/{record_id}")
+async def task_status(record_id: str):
+    task = state.get_task(record_id)
+    if task is None:
+        raise HTTPException(404, "unknown task")
+    return {"record_id": record_id, **task}
+
+
+@app.get("/files/{bucket}/{path:path}")
+async def get_file(bucket: str, path: str):
+    try:
+        data = await _read_file_bytes(app.state.db, bucket, path)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        logger.error("Failed to read file %s:%s: %s", bucket, path, e)
+        raise HTTPException(500, "failed to read file")
+
+    if data is None:
+        raise HTTPException(404, "file not found")
+
+    media = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    return Response(content=data, media_type=media)
+
+
+@app.get("/queue/stream")
+async def queue_stream():
+    async def gen():
+        q = broadcaster.subscribe()
+        try:
+            yield _sse({"type": "snapshot", "data": state.snapshot()})
+            while True:
+                msg = await q.get()
+                yield _sse({"type": "task", "data": msg})
+        finally:
+            broadcaster.unsubscribe(q)
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+def _sse(data: dict) -> str:
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
