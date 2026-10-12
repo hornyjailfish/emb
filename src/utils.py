@@ -12,6 +12,12 @@ missing_libs = [lib for lib in REQUIRED_LIBS if util.find_spec(lib) is None]
 missing_optional_libs = [lib for lib in OPTIONAL_LIBS if util.find_spec(lib) is None]
 missing_utility_libs = [lib for lib in UTILITY_LIBS if util.find_spec(lib) is None]
 
+def quiet_third_party_loggers():
+    """Silence INFO/DEBUG chatter from HTTP and model-download libraries."""
+    for noisy in ("httpx", "httpcore", "urllib3", "huggingface_hub", "transformers"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
 def setup_logging(log_level):
     root_logger = logging.getLogger()
     if "colorlog" in missing_utility_libs:
@@ -33,6 +39,7 @@ def setup_logging(log_level):
         root_logger.addHandler(handler)
 
     root_logger.setLevel(log_level)
+    quiet_third_party_loggers()
 
 def setup_process_prio():
     if set(missing_optional_libs) & {"win32api", "win32con", "win32process"}:

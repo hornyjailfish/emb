@@ -14,6 +14,8 @@ class ServiceState:
         self.started_at = time.time()
         self.model_state = "loading"  # loading | ready | error
         self.model_error: str | None = None
+        self.db_connected = False
+        self.db_error: str | None = None
         self.processed = 0
         self.errors = 0
         # record_id -> {"status": queued|processing|done|error, "error": str|None}
@@ -23,6 +25,15 @@ class ServiceState:
         with self._lock:
             self.model_state = state
             self.model_error = error
+
+    def model_ready(self) -> bool:
+        with self._lock:
+            return self.model_state == "ready"
+
+    def set_db_status(self, connected: bool, error: str | None = None) -> None:
+        with self._lock:
+            self.db_connected = connected
+            self.db_error = error
 
     def set_task(self, record_id: str, status: str, error: str | None = None) -> None:
         with self._lock:
@@ -52,6 +63,8 @@ class ServiceState:
             return {
                 "model": self.model_state,
                 "model_error": self.model_error,
+                "db_connected": self.db_connected,
+                "db_error": self.db_error,
                 "uptime_seconds": int(time.time() - self.started_at),
                 "processed": self.processed,
                 "errors": self.errors,

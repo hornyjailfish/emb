@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     modalities: str = "vision"
     hf_home: str = "D:/models/"
     device: str = check_cuda()
+    query_timeout: float = 60.0
 
     surrealdb_host: str
     surrealdb_user: str
