@@ -1,9 +1,12 @@
+import io
 import logging
 import math
 import threading
 import uuid
 from dataclasses import dataclass
 from queue import Empty, Queue
+
+from PIL import Image
 
 from src.config import Settings, get_settings
 from src.state import ServiceState
@@ -23,14 +26,13 @@ class QueryError(RuntimeError):
 class ModelJob:
     record_id: str
     text: str | None
-    image_url: str | None
+    image: Image.Image | str | None  # prepared PIL image, or a source the model loads
 
 
 @dataclass
 class ModelResult:
     record_id: str
-    text_embedding: list[float] | None
-    image_embedding: list[float] | None
+    embedding: list[float] | None
     error: str | None
 
 
@@ -38,14 +40,13 @@ class ModelResult:
 class QueryJob:
     query_id: str
     text: str | None
-    image_url: str | None
+    image: Image.Image | str | None  # prepared PIL image, or a source the model loads
     normalize: bool = False
 
 
 @dataclass
 class QueryResult:
-    text_embedding: list[float] | None
-    image_embedding: list[float] | None
+    embedding: list[float] | None
     error: str | None
 
 
@@ -65,6 +66,38 @@ def _normalize(vec: list[float] | None) -> list[float] | None:
     if norm == 0.0:
         return vec
     return [x / norm for x in vec]
+
+
+def _fused_input(
+    text: str | None, image: Image.Image | str | None
+) -> str | Image.Image | tuple | None:
+    """Build the model input.
+
+    A (text, image) tuple fuses both modalities into ONE embedding in a single
+    forward pass; a lone modality is passed through unchanged.
+    """
+    if text and image:
+        return (text, image)
+    return text or image
+
+
+def prepare_image(data: bytes, max_pixels: int) -> Image.Image:
+    """Decode image bytes and downscale them (aspect ratio kept) for encoding.
+
+    The model's vision processor turns images into 256-1280 vision tokens
+    (262144..1310720 px), so CPU cost scales with image size. Capping at
+    `max_pixels` keeps inference fast without distorting the picture. The
+    config default (`image_max_pixels`, 262144 px ~= 512x512) is the model's
+    floor — the fastest CPU setting. Returns a PIL Image, which the model
+    accepts directly.
+    """
+    img = Image.open(io.BytesIO(data)).convert("RGB")
+    w, h = img.size
+    if w * h <= max_pixels:
+        return img
+    scale = (max_pixels / (w * h)) ** 0.5
+    new_size = (max(1, round(w * scale)), max(1, round(h * scale)))
+    return img.resize(new_size, Image.Resampling.LANCZOS)
 
 
 class ModelWorker:
@@ -113,11 +146,27 @@ class ModelWorker:
     def _run(self) -> None:
         self.state.set_model_state("loading")
         try:
-            self._model = self._load_model()
+            # self._model = self._load_model()
+            self._model = None
         except Exception as e:
             logger.exception("Model failed to load")
             self.state.set_model_state("error", str(e))
             return
+
+        # Surface a failed vision/audio processor early (e.g. missing torchvision)
+        # instead of a late, confusing "'NoneType' object is not callable" on the
+        # first image job.
+        module = None
+        try:
+            module = self._model[0] if len(self._model) else None
+        except (TypeError, KeyError, IndexError, AttributeError):
+            module = None
+        if module is not None and getattr(module, "processor", None) is None:
+            logger.error(
+                "Model multimodal processor failed to initialize; image/audio "
+                "embeddings will fail. Install the required modality extras "
+                "(e.g. torchvision) and restart the service."
+            )
 
         self.state.set_model_state("ready")
         logger.info("Model ready")
@@ -139,58 +188,57 @@ class ModelWorker:
                 continue
             self._handle_document(job)
 
-    def _handle_document(self, job: ModelJob) -> None:
+    def _encode(self, method, content) -> tuple[list[float] | None, str | None]:
+        """Encode one input (text, image, or a fused tuple). Returns (vector, error);
+        never raises.
+
+        Malformed or missing images are already dropped before this point (see
+        prepare_image / main._prepare_image), so a bad image cannot discard a
+        valid text embedding.
+        """
+        if content is None:
+            return None, None
         try:
-            result = ModelResult(
-                record_id=job.record_id,
-                text_embedding=_to_list(self._model.encode_document(job.text)) if job.text else None,
-                image_embedding=_to_list(self._model.encode_document(job.image_url)) if job.image_url else None,
-                error=None,
-            )
+            return _to_list(method(content)), None
         except Exception as e:
-            result = ModelResult(
-                record_id=job.record_id,
-                text_embedding=None,
-                image_embedding=None,
-                error=str(e),
-            )
-        self.results.put(result)
+            msg = f"encode failed: {e}"
+            logger.warning("%s", msg)
+            return None, msg
+
+    def _handle_document(self, job: ModelJob) -> None:
+        logger.info(job)
+        embedding, error = self._encode(
+            self._model.encode_document, _fused_input(job.text, job.image)
+        )
+        self.results.put(
+            ModelResult(record_id=job.record_id, embedding=embedding, error=error)
+        )
 
     def _handle_query(self, job: QueryJob) -> None:
-        try:
-            text_embedding = _to_list(self._model.encode_query(job.text)) if job.text else None
-            image_embedding = _to_list(self._model.encode_query(job.image_url)) if job.image_url else None
-            if job.normalize:
-                text_embedding = _normalize(text_embedding)
-                image_embedding = _normalize(image_embedding)
-            result = QueryResult(
-                text_embedding=text_embedding,
-                image_embedding=image_embedding,
-                error=None,
-            )
-        except Exception as e:
-            result = QueryResult(
-                text_embedding=None,
-                image_embedding=None,
-                error=str(e),
-            )
+        embedding, error = self._encode(
+            self._model.encode_query, _fused_input(job.text, job.image)
+        )
+        if job.normalize:
+            embedding = _normalize(embedding)
+        logger.info("Query done: %s", job.query_id)
         with self._query_cond:
-            self._query_results[job.query_id] = result
+            self._query_results[job.query_id] = QueryResult(
+                embedding=embedding, error=error
+            )
             self._query_cond.notify_all()
 
     def encode_query(
         self,
         text: str | None,
-        image_url: str | None,
+        image: Image.Image | str | None,
         timeout: float = 60.0,
         normalize: bool = False,
-    ) -> tuple[list[float] | None, list[float] | None]:
+    ) -> list[float] | None:
         """Block the caller until the worker encodes a query and returns it.
 
         Runs on the worker thread but is safe to call from the event loop via
-        `asyncio.to_thread`. Returns (text_embedding, image_embedding); each is
-        None when that modality wasn't supplied. `normalize` L2-normalizes the
-        returned vectors.
+        `asyncio.to_thread`. Returns the single fused query embedding (None if
+        no input was given). `normalize` L2-normalizes the returned vector.
         """
         if self._stop.is_set():
             raise ModelNotReadyError("model worker is stopped")
@@ -200,7 +248,7 @@ class ModelWorker:
         query_id = uuid.uuid4().hex
         with self._query_cond:
             self._query_results.pop(query_id, None)
-            self.query_jobs.put(QueryJob(query_id=query_id, text=text, image_url=image_url, normalize=normalize))
+            self.query_jobs.put(QueryJob(query_id=query_id, text=text, image=image, normalize=normalize))
             ok = self._query_cond.wait_for(
                 lambda: query_id in self._query_results,
                 timeout=timeout,
@@ -211,4 +259,4 @@ class ModelWorker:
             raise TimeoutError("query encoding timed out")
         if result.error:
             raise QueryError(result.error)
-        return result.text_embedding, result.image_embedding
+        return result.embedding

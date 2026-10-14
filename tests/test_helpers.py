@@ -9,8 +9,8 @@ import unittest
 from fastapi import HTTPException
 from surrealdb import RecordID
 
-from src.main import _build_proxy_url, _parse_record_id, _safe_literal_segment, settings
-from src.worker import _normalize, _to_list
+from src.main import _build_proxy_url, _parse_record_id, _queue_rid, _safe_literal_segment, settings
+from src.worker import _normalize, _to_list, prepare_image
 
 
 class ToListTests(unittest.TestCase):
@@ -90,6 +90,43 @@ class ParseRecordIdTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as ctx:
             _parse_record_id("invalid")
         self.assertEqual(ctx.exception.status_code, 422)
+
+
+class QueueRidTests(unittest.TestCase):
+    def test_maps_marker_views_key_to_embedding_queue(self):
+        # The add_embedding_task event keys the queue row by record::id($after.id),
+        # so the queue row shares the marker_views record's key.
+        self.assertEqual(str(_queue_rid("marker_views:abc123")), "embedding_queue:abc123")
+
+    def test_preserves_string_key(self):
+        q = _queue_rid("marker_views:abc123")
+        self.assertEqual(q.table_name, "embedding_queue")
+        self.assertEqual(q.id, "abc123")
+
+
+class PrepareImageTests(unittest.TestCase):
+    def _png_bytes(self, w, h):
+        import io
+
+        from PIL import Image
+
+        buf = io.BytesIO()
+        Image.new("RGB", (w, h), (200, 100, 50)).save(buf, format="PNG")
+        return buf.getvalue()
+
+    def test_small_image_unchanged(self):
+        img = prepare_image(self._png_bytes(100, 80), max_pixels=262144)
+        self.assertEqual(img.size, (100, 80))
+
+    def test_large_image_downscaled_keeping_aspect(self):
+        img = prepare_image(self._png_bytes(2000, 1000), max_pixels=262144)
+        w, h = img.size
+        self.assertLessEqual(w * h, 262144)
+        self.assertAlmostEqual(w / h, 2.0, delta=0.05)
+
+    def test_no_upscale(self):
+        img = prepare_image(self._png_bytes(50, 40), max_pixels=262144)
+        self.assertEqual(img.size, (50, 40))
 
 
 if __name__ == "__main__":

@@ -85,16 +85,13 @@ class RealModelIntegrationTest(unittest.TestCase):
         self.assertIsNotNone(self.worker._model)
 
     def test_query_embedding_format(self):
-        text_emb, image_emb = self.worker.encode_query(
-            "How is the weather today?", None, timeout=300
-        )
-        self.assertIsNone(image_emb)
-        self.assertIsInstance(text_emb, list)
-        self.assertGreater(len(text_emb), 0)
-        self.assertTrue(all(isinstance(x, float) for x in text_emb))
+        emb = self.worker.encode_query("How is the weather today?", None, timeout=300)
+        self.assertIsInstance(emb, list)
+        self.assertGreater(len(emb), 0)
+        self.assertTrue(all(isinstance(x, float) for x in emb))
 
     def test_query_normalization(self):
-        emb, _ = self.worker.encode_query("weather forecast", None, timeout=300, normalize=True)
+        emb = self.worker.encode_query("weather forecast", None, timeout=300, normalize=True)
         norm = math.sqrt(sum(x * x for x in emb))
         self.assertAlmostEqual(norm, 1.0, places=5)
 
@@ -106,20 +103,16 @@ class RealModelIntegrationTest(unittest.TestCase):
         self.assertGreater(len(vec), 0)
 
     def test_image_embedding(self):
-        text_emb, image_emb = self.worker.encode_query(None, self.image_path, timeout=300)
-        self.assertIsNone(text_emb)
-        self.assertIsInstance(image_emb, list)
-        self.assertGreater(len(image_emb), 0)
-        self.assertTrue(all(isinstance(x, float) for x in image_emb))
+        emb = self.worker.encode_query(None, self.image_path, timeout=300)
+        self.assertIsInstance(emb, list)
+        self.assertGreater(len(emb), 0)
+        self.assertTrue(all(isinstance(x, float) for x in emb))
 
-    def test_text_and_image_embeddings(self):
-        text_emb, image_emb = self.worker.encode_query("a red car", self.image_path, timeout=300)
-        self.assertIsInstance(text_emb, list)
-        self.assertIsInstance(image_emb, list)
-        self.assertGreater(len(text_emb), 0)
-        self.assertGreater(len(image_emb), 0)
-        self.assertTrue(all(isinstance(x, float) for x in text_emb))
-        self.assertTrue(all(isinstance(x, float) for x in image_emb))
+    def test_fused_text_and_image_embedding(self):
+        emb = self.worker.encode_query("a red car", self.image_path, timeout=300)
+        self.assertIsInstance(emb, list)
+        self.assertGreater(len(emb), 0)
+        self.assertTrue(all(isinstance(x, float) for x in emb))
 
     def test_document_image_embedding(self):
         model = self.worker._model
@@ -134,11 +127,10 @@ class RealModelIntegrationTest(unittest.TestCase):
 
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
-        self.assertIn("text_embedding", body)
-        self.assertNotIn("image_embedding", body)
-        self.assertIsInstance(body["text_embedding"], list)
-        self.assertGreater(len(body["text_embedding"]), 0)
-        self.assertTrue(all(isinstance(x, float) for x in body["text_embedding"]))
+        self.assertIn("embedding", body)
+        self.assertIsInstance(body["embedding"], list)
+        self.assertGreater(len(body["embedding"]), 0)
+        self.assertTrue(all(isinstance(x, float) for x in body["embedding"]))
 
 
 if __name__ == "__main__":

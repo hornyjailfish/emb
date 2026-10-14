@@ -8,16 +8,24 @@ from contextlib import asynccontextmanager
 from queue import Empty
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response, StreamingResponse
+from PIL import Image
 from pydantic import BaseModel
-from surrealdb import AsyncSurreal, RecordID
+from surrealdb import AsyncSurreal, AsyncWsSurrealConnection, RecordID
 from surrealdb.errors import InvalidRecordIdError
 
 from src.config import Settings, get_settings
 from src.state import ServiceState
 from src.utils import check_deps, setup_logging, setup_process_prio
-from src.worker import ModelJob, ModelNotReadyError, ModelWorker, QueryError
+from src.worker import (
+    ModelJob,
+    ModelNotReadyError,
+    ModelWorker,
+    QueryError,
+    prepare_image,
+)
 
 setup_logging(logging.INFO)
 check_deps()
@@ -28,7 +36,7 @@ settings = get_settings()
 state = ServiceState()
 worker = ModelWorker(state)
 
-job_queue: asyncio.Queue[RecordID] = asyncio.Queue()
+job_queue: asyncio.Queue[RecordID] = asyncio.Queue(maxsize=settings.queue_capacity)
 
 
 def _setup_runtime(s: Settings) -> None:
@@ -99,7 +107,8 @@ async def _read_file_bytes(db: Any, bucket: str, path: str) -> bytes | None:
     if result is None:
         return None
     if isinstance(result, bytes):
-        return result
+        # Empty blob is treated as missing so the model never sees a zero-byte file.
+        return result or None
     raise ValueError(f"unexpected file result: {type(result).__name__}")
 
 
@@ -113,7 +122,7 @@ class Connection:
     def __init__(self, s: Settings, state: ServiceState):
         self.settings = s
         self.state = state
-        self.db: Any = None
+        self.db: AsyncWsSurrealConnection | None = None
         self.ready = asyncio.Event()
         self._announced_down = False
 
@@ -169,10 +178,17 @@ class Connection:
 
 
 class Broadcaster:
+    """Fan-out for SSE clients. `close()` wakes every subscriber so streams end."""
+
+    _SHUTDOWN = object()
+
     def __init__(self) -> None:
         self._subs: set[asyncio.Queue] = set()
+        self._closed = False
 
     def subscribe(self) -> asyncio.Queue:
+        if self._closed:
+            raise RuntimeError("broadcaster closed")
         q: asyncio.Queue = asyncio.Queue()
         self._subs.add(q)
         return q
@@ -181,8 +197,25 @@ class Broadcaster:
         self._subs.discard(q)
 
     def publish(self, data: dict) -> None:
+        if self._closed:
+            return
         for q in list(self._subs):
             q.put_nowait(data)
+
+    def close(self) -> None:
+        """Force-disconnect all SSE clients (used on app shutdown)."""
+        self._closed = True
+        for q in list(self._subs):
+            try:
+                q.put_nowait(self._SHUTDOWN)
+            except Exception:
+                pass
+        self._subs.clear()
+
+    def reset(self) -> None:
+        """Allow new subscribers after a previous close (new lifespan)."""
+        self._closed = False
+        self._subs.clear()
 
 
 broadcaster = Broadcaster()
@@ -195,41 +228,135 @@ def _parse_record_id(raw: str) -> RecordID:
         raise HTTPException(422, f"invalid record id: {raw}") from e
 
 
+def _queue_info() -> dict:
+    """Snapshot of the dispatch queue for /health and the SSE feed."""
+    return {
+        "queue_capacity": settings.queue_capacity,
+        "queue_size": job_queue.qsize(),
+    }
+
+
+# The embedding_queue row for a marker_views record shares its record key: the
+# add_embedding_task event does `UPSERT type::record("embedding_queue",
+# record::id($after.id))`, so marker_views:abc maps to embedding_queue:abc. Its
+# `status` column is the enum 'pending' | 'processing' | 'failed' | 'done' and
+# `error_message` holds the failure reason. We mirror the in-memory task state
+# onto that row so the queue reflects progress durably.
+_QUEUE_STATUS = {
+    "queued": "pending",
+    "processing": "processing",
+    "done": "done",
+    "error": "failed",
+}
+
+
+def _queue_rid(rid: str) -> RecordID:
+    """Map a marker_views record id to its embedding_queue record id."""
+    return RecordID("embedding_queue", RecordID.parse(rid).id)
+
+
+async def _set_queue_status(
+    conn: Connection, rid: str, status: str, error: str | None = None
+) -> None:
+    """Reflect a task's status onto its embedding_queue row (best-effort).
+
+    Never raises: a failed status write must not stall the dispatch/persist loop.
+    """
+    try:
+        queue_rid = _queue_rid(rid)
+    except Exception as e:
+        logger.warning("Cannot derive embedding_queue id for %s: %s", rid, e)
+        return
+    try:
+        await conn.ready.wait()
+        await conn.db.merge(
+            queue_rid,
+            {"status": _QUEUE_STATUS.get(status, status), "error_message": error},
+        )
+    except Exception as e:
+        logger.warning("Failed to update embedding_queue status for %s: %s", rid, e)
+
+
+async def _image_bytes(conn: Connection, raw: str) -> bytes | None:
+    """Load raw image bytes from a record's image_url.
+
+    Handles both bucket file pointers ("bucket:/path", read straight from the DB)
+    and http(s) URLs.
+    """
+    if raw.startswith(("http://", "https://")):
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(raw)
+                resp.raise_for_status()
+                return resp.content
+        except Exception as e:
+            logger.warning("Failed to fetch image %s: %s", raw, e)
+            return None
+    bucket, sep, path = raw.partition(":")
+    path = path.lstrip("/")
+    if not sep or not bucket or not path:
+        return None
+    try:
+        return await _read_file_bytes(conn.db, bucket, path)
+    except Exception as e:
+        logger.warning("Failed to read image %s: %s", raw, e)
+        return None
+
+
+async def _prepare_image(conn: Connection, raw: str | None) -> Image.Image | None:
+    """Load a record's image and downscale it (see prepare_image) for encoding."""
+    if not raw:
+        return None
+    data = await _image_bytes(conn, raw)
+    if not data:
+        return None
+    try:
+        return await asyncio.to_thread(prepare_image, data, settings.image_max_pixels)
+    except Exception as e:
+        logger.warning("Failed to prepare image %s: %s", raw, e)
+        return None
+
+
 async def _dispatch(conn: Connection) -> None:
     while True:
         await conn.ready.wait()
         rid_obj = await job_queue.get()
         rid = str(rid_obj)
         state.set_task(rid, "processing")
+        await _set_queue_status(conn, rid, "processing")
         logger.info("Processing %s", rid)
 
         try:
             rec = await conn.db.select(rid_obj)
+            logger.info(rec)
             if isinstance(rec, list):
                 rec = rec[0] if rec else None
         except Exception as e:
             logger.warning("Failed to select %s: %s", rid, e)
             state.set_task(rid, "error", str(e))
+            await _set_queue_status(conn, rid, "error", str(e))
             state.bump(ok=False)
             broadcaster.publish({"record_id": rid, "status": "error", "error": str(e)})
             continue
 
         if not rec or not isinstance(rec, dict):
             state.set_task(rid, "error", "record not found")
+            await _set_queue_status(conn, rid, "error", "record not found")
             state.bump(ok=False)
             broadcaster.publish({"record_id": rid, "status": "error", "error": "record not found"})
             continue
 
         text = (rec.get("generated_description") or "").strip() or None
-        image_proxy = _build_proxy_url(rec.get("image_url"))
+        image = await _prepare_image(conn, rec.get("image_url"))
 
-        if text is None and image_proxy is None:
+        if text is None and image is None:
             state.set_task(rid, "error", "no text or image to embed")
+            await _set_queue_status(conn, rid, "error", "no text or image to embed")
             state.bump(ok=False)
             broadcaster.publish({"record_id": rid, "status": "error", "error": "no text or image to embed"})
             continue
 
-        worker.jobs.put(ModelJob(record_id=rid, text=text, image_url=image_proxy))
+        worker.jobs.put(ModelJob(record_id=rid, text=text, image=image))
 
 
 async def _persist(conn: Connection) -> None:
@@ -242,15 +369,12 @@ async def _persist(conn: Connection) -> None:
 
         if result.error:
             state.set_task(rid, "error", result.error)
+            await _set_queue_status(conn, rid, "error", result.error)
             state.bump(ok=False)
             broadcaster.publish({"record_id": rid, "status": "error", "error": result.error})
             continue
 
-        data: dict[str, Any] = {}
-        if result.text_embedding is not None:
-            data["text_embedding"] = result.text_embedding
-        if result.image_embedding is not None:
-            data["image_embedding"] = result.image_embedding
+        data: dict[str, Any] = {"embedding": result.embedding}
 
         try:
             await conn.ready.wait()
@@ -258,11 +382,13 @@ async def _persist(conn: Connection) -> None:
         except Exception as e:
             logger.warning("Failed to persist %s: %s", rid, e)
             state.set_task(rid, "error", str(e))
+            await _set_queue_status(conn, rid, "error", str(e))
             state.bump(ok=False)
             broadcaster.publish({"record_id": rid, "status": "error", "error": str(e)})
             continue
 
         state.set_task(rid, "done")
+        await _set_queue_status(conn, rid, "done")
         state.bump(ok=True)
         broadcaster.publish({"record_id": rid, "status": "done"})
         logger.info("Embedded and saved %s", rid)
@@ -271,6 +397,7 @@ async def _persist(conn: Connection) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _setup_runtime(settings)
+    broadcaster.reset()
     conn = Connection(settings, state)
     app.state.conn = conn
     await conn.connect()
@@ -282,6 +409,8 @@ async def lifespan(app: FastAPI):
     logger.info("Service ready (model loading in background)")
     yield
 
+    # Drop SSE first so open streams do not block uvicorn shutdown.
+    broadcaster.close()
     worker.stop()
     for t in (dispatch_task, persist_task, reconnect_task):
         t.cancel()
@@ -306,7 +435,6 @@ class QueryRequest(BaseModel):
 async def generate(payload: GenerateRequest):
     if not payload.items:
         raise HTTPException(400, "items must not be empty")
-
     accepted: list[str] = []
     for raw in payload.items:
         rid_obj = _parse_record_id(raw.strip())
@@ -318,20 +446,29 @@ async def generate(payload: GenerateRequest):
 
     return {"accepted": accepted, "count": len(accepted)}
 
+# @app.get("/test")
+# async def test():
+#     conn: Connection = app.state.conn
+#     res = await conn.db.query("select * from marker_views")
+#     logger.info(res)
+#     return { "connection": "???" }
 
 @app.post("/encode")
 async def encode(payload: QueryRequest):
     text = (payload.text or "").strip() or None
-    image_proxy = _build_proxy_url(payload.image_url)
+    image = None
+    if payload.image_url:
+        conn: Connection = app.state.conn
+        image = await _prepare_image(conn, payload.image_url)
 
-    if text is None and image_proxy is None:
+    if text is None and image is None:
         raise HTTPException(400, "provide either text or image_url")
 
     try:
-        text_embedding, image_embedding = await asyncio.to_thread(
+        embedding = await asyncio.to_thread(
             worker.encode_query,
             text,
-            image_proxy,
+            image,
             settings.query_timeout,
             payload.normalize,
         )
@@ -340,13 +477,7 @@ async def encode(payload: QueryRequest):
     except QueryError as e:
         raise HTTPException(502, str(e))
 
-    embeddings: dict[str, Any] = {}
-    if text_embedding is not None:
-        embeddings["text_embedding"] = text_embedding
-    if image_embedding is not None:
-        embeddings["image_embedding"] = image_embedding
-
-    return embeddings
+    return {"embedding": embedding}
 
 
 @app.get("/health")
@@ -365,6 +496,7 @@ async def health():
             "total_errors": snap["errors"],
         },
         "pending": snap["pending"],
+        **_queue_info(),
     }
 
 
@@ -403,16 +535,32 @@ async def get_file(bucket: str, path: str):
 @app.get("/queue/stream")
 async def queue_stream():
     async def gen():
-        q = broadcaster.subscribe()
         try:
-            yield _sse({"type": "snapshot", "data": state.snapshot()})
+            q = broadcaster.subscribe()
+        except RuntimeError:
+            yield _sse({"type": "shutdown"})
+            return
+
+        try:
+            yield _sse({"type": "snapshot", "data": {**state.snapshot(), **_queue_info()}})
             while True:
                 msg = await q.get()
+                if msg is Broadcaster._SHUTDOWN:
+                    yield _sse({"type": "shutdown"})
+                    break
                 yield _sse({"type": "task", "data": msg})
         finally:
             broadcaster.unsubscribe(q)
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 def _sse(data: dict) -> str:

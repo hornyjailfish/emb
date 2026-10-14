@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     hf_home: str = "D:/models/"
     device: str = check_cuda()
     query_timeout: float = 60.0
+    # Downscale images to at most this many pixels (aspect ratio kept) before
+    # encoding. 262144 px (~512x512) yields the model's 256-vision-token floor
+    # (its range is 256-1280 tokens), minimising CPU inference cost per image.
+    image_max_pixels: int = 262144
+    # Maximum records waiting in the dispatch queue (0 = unbounded).
+    queue_capacity: int = 0
 
     surrealdb_host: str
     surrealdb_user: str
