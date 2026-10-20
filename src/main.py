@@ -17,6 +17,15 @@ from surrealdb import AsyncSurreal, AsyncSurrealConnection, File, RecordID
 from surrealdb.errors import InvalidRecordIdError
 
 from src.config import Settings, get_settings
+from src.search import (
+    TARGETS,
+    aggregate_by_parent,
+    bind_filters,
+    build_candidate_query,
+    candidate_limit,
+    get_target,
+    hydrate_parents,
+)
 from src.state import ServiceState
 from src.utils import check_deps, setup_logging, setup_process_prio
 from src.worker import (
@@ -541,6 +550,55 @@ class QueryRequest(BaseModel):
     normalize: bool = False
 
 
+class SearchRequest(BaseModel):
+    """Cosine search over a registered target (default: markers via marker_views).
+
+    Provide ``text``, ``image_url``, or both. ``top_k`` is the number of parent
+    entities (markers) returned after view-level hits are summed per parent.
+    ``filters`` keys depend on the target (markers: ``level``).
+    """
+
+    target: str = "markers"
+    text: str | None = None
+    image_url: str | None = None
+    top_k: int = 10
+    filters: dict[str, Any] | None = None
+
+
+async def _encode_inputs(
+    *,
+    text: str | None,
+    image_url: str | None,
+    normalize: bool,
+) -> list[float]:
+    """Shared path for /encode and /search: load image, run query encode."""
+    text = (text or "").strip() or None
+    image = None
+    if image_url:
+        conn: Connection = app.state.conn
+        image = await _prepare_image(conn, image_url)
+
+    if text is None and image is None:
+        raise HTTPException(400, "provide text and/or image_url")
+
+    try:
+        embedding = await asyncio.to_thread(
+            worker.encode_query,
+            text,
+            image,
+            settings.query_timeout,
+            normalize,
+        )
+    except (TimeoutError, ModelNotReadyError) as e:
+        raise HTTPException(503, str(e))
+    except QueryError as e:
+        raise HTTPException(502, str(e))
+
+    if not embedding:
+        raise HTTPException(502, "model returned an empty embedding")
+    return embedding
+
+
 @app.post("/generate", status_code=202)
 async def generate(payload: GenerateRequest):
     if not payload.items:
@@ -559,29 +617,99 @@ async def generate(payload: GenerateRequest):
 
 @app.post("/encode")
 async def encode(payload: QueryRequest):
-    text = (payload.text or "").strip() or None
-    image = None
-    if payload.image_url:
-        conn: Connection = app.state.conn
-        image = await _prepare_image(conn, payload.image_url)
+    embedding = await _encode_inputs(
+        text=payload.text,
+        image_url=payload.image_url,
+        normalize=payload.normalize,
+    )
+    return {"embedding": embedding}
 
-    if text is None and image is None:
-        raise HTTPException(400, "provide either text or image_url")
+
+@app.post("/search")
+async def search(payload: SearchRequest):
+    if payload.top_k < 1:
+        raise HTTPException(400, "top_k must be >= 1")
+    if payload.top_k > 100:
+        raise HTTPException(400, "top_k must be <= 100")
 
     try:
-        embedding = await asyncio.to_thread(
-            worker.encode_query,
-            text,
-            image,
-            settings.query_timeout,
-            payload.normalize,
-        )
-    except (TimeoutError, ModelNotReadyError) as e:
-        raise HTTPException(503, str(e))
-    except QueryError as e:
-        raise HTTPException(502, str(e))
+        target = get_target(payload.target)
+    except KeyError as e:
+        raise HTTPException(400, str(e)) from e
 
-    return {"embedding": embedding}
+    try:
+        filter_clauses, filter_params = bind_filters(target, payload.filters)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+    # Cosine search needs unit-length vectors; always normalize the query.
+    query_vec = await _encode_inputs(
+        text=payload.text,
+        image_url=payload.image_url,
+        normalize=True,
+    )
+
+    conn: Connection = app.state.conn
+    if not conn.ready.is_set() or conn.db is None:
+        raise HTTPException(503, "database unavailable")
+
+    limit = candidate_limit(target, payload.top_k)
+    sql = build_candidate_query(
+        target, filter_clauses=filter_clauses, limit=limit
+    )
+    params: dict[str, Any] = {"query": query_vec, **filter_params}
+
+    try:
+        await conn.ready.wait()
+        rows = await conn.db.query(sql, params)
+    except Exception as e:
+        logger.warning("Search query failed: %s", e)
+        raise HTTPException(502, f"search query failed: {e}") from e
+
+    if rows is None:
+        rows = []
+    if not isinstance(rows, list):
+        raise HTTPException(502, f"unexpected search result: {type(rows).__name__}")
+
+    # Keep only well-formed scored dicts.
+    scored = [r for r in rows if isinstance(r, dict) and "score" in r]
+
+    if target.parent_field:
+        hits = aggregate_by_parent(
+            scored, parent_field=target.parent_field, top_k=payload.top_k
+        )
+        hits = await hydrate_parents(conn.db, target, hits)
+    else:
+        # No parent collapse — return source rows directly.
+        hits = [
+            {
+                "id": str(r.get("id")),
+                "score": float(r["score"]),
+            }
+            for r in scored[: payload.top_k]
+        ]
+
+    return {
+        "target": target.name,
+        "top_k": payload.top_k,
+        "count": len(hits),
+        "results": hits,
+    }
+
+
+@app.get("/search/targets")
+async def search_targets():
+    """List registered search targets and their filter keys (for clients)."""
+    return {
+        name: {
+            "source_table": t.source_table,
+            "parent_table": t.parent_table,
+            "parent_field": t.parent_field,
+            "filters": [f.key for f in t.filters],
+            "parent_fields": list(t.parent_fields),
+        }
+        for name, t in TARGETS.items()
+    }
 
 
 @app.get("/health")

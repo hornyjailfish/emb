@@ -108,18 +108,73 @@ The model runs on CPU, so image size is the main cost driver.
 - `src/config.py` — pydantic-settings (`Settings`, `get_settings`).
 - `src/state.py` — `ServiceState`, small thread-safe status registry.
 - `src/worker.py` — model worker thread, `prepare_image`, `ModelJob` / `ModelResult`.
+- `src/search.py` — search target registry, cosine candidate query, parent aggregation.
 - `src/main.py` — app, endpoints, dispatch/persist tasks, SSE, image loading.
 - `src/utils.py` — logging, dependency check, Windows process priority.
 - `run.py` — uvicorn entrypoint (`reload=True`).
 - `requirements.txt` — pins `surrealdb>=3.0.0b10`.
 
+## Search
+
+`POST /search` encodes a query (text and/or image — either alone is fine),
+runs cosine similarity over a registered **target**, collapses source rows
+onto a parent entity, and returns top-k parents.
+
+### Markers target (default)
+
+- Source vectors: `marker_views.embedding`
+- Parent: `marker_views.marker` → `markers`
+- Score: **sum** of matching view cosines (extra views add points)
+- Filter: `filters.level` → `marker.level` (record id)
+- Response hydrates parent `level`, `zone`, `closest_shop`, `geometry`
+
+```json
+POST /search
+{
+  "target": "markers",
+  "text": "near the fountain",
+  "image_url": null,
+  "top_k": 10,
+  "filters": { "level": "levels:ground" }
+}
+```
+
+```json
+{
+  "target": "markers",
+  "top_k": 10,
+  "count": 1,
+  "results": [
+    {
+      "id": "markers:abc",
+      "score": 1.42,
+      "views": [
+        { "id": "marker_views:1", "score": 0.91 },
+        { "id": "marker_views:2", "score": 0.51 }
+      ],
+      "level": "levels:ground",
+      "geometry": { "...": "geojson point" }
+    }
+  ]
+}
+```
+
+### Extending to more tables
+
+Register another `SearchTarget` in `src/search.py` → `TARGETS`. No endpoint
+change. Each target declares source table, embedding field, optional parent
+collapse, filters (`FilterDef`), and parent columns to hydrate.
+`GET /search/targets` lists what is registered.
+
 ## Endpoints
 
 - `POST /generate` `{"items": ["marker_views:..."]}` → `202`
 - `POST /encode` `{"text": "..."}` and/or `{"image_url": "..."}` → `{"embedding": [...]}`
+- `POST /search` — cosine search (see Search); text and/or image, `top_k`, filters
+- `GET /search/targets` — registered targets + filter keys
 - `GET /health`
 - `GET /tasks`, `GET /tasks/{record_id}`
-- `GET /queue/stream` — SSE task feed (`queued` / `processing` / `done` / `error`)
+- `GET /queue/stream` — SSE task feed (`queued` / `processing` / `done` / `error` / `queue_done`)
 - `GET /files/{bucket}/{path}` — bucket file proxy
 
 ## Conventions
