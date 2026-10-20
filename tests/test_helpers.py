@@ -7,9 +7,16 @@ from main. None of these touch SurrealDB or load the model.
 import unittest
 
 from fastapi import HTTPException
-from surrealdb import RecordID
+from surrealdb import File, RecordID
 
-from src.main import _build_proxy_url, _parse_record_id, _queue_rid, _safe_literal_segment, settings
+from src.main import (
+    _as_file,
+    _build_proxy_url,
+    _parse_record_id,
+    _queue_rid,
+    _safe_literal_segment,
+    settings,
+)
 from src.worker import _normalize, _to_list, prepare_image
 
 
@@ -56,6 +63,10 @@ class BuildProxyUrlTests(unittest.TestCase):
         expected = f"http://127.0.0.1:{settings.fastapi_port}/files/bkt/path"
         self.assertEqual(_build_proxy_url("bkt://path"), expected)
 
+    def test_native_file(self):
+        expected = f"http://127.0.0.1:{settings.fastapi_port}/files/bkt/path/img.png"
+        self.assertEqual(_build_proxy_url(File("bkt", "/path/img.png")), expected)
+
     def test_no_path(self):
         self.assertIsNone(_build_proxy_url("bkt:"))
 
@@ -64,6 +75,23 @@ class BuildProxyUrlTests(unittest.TestCase):
 
     def test_no_colon_returns_raw(self):
         self.assertEqual(_build_proxy_url("plain"), "plain")
+
+
+class AsFileTests(unittest.TestCase):
+    def test_native_passthrough(self):
+        f = File("images", "/a.png")
+        self.assertIs(_as_file(f), f)
+
+    def test_string_forms(self):
+        self.assertEqual(_as_file("bkt:/path/img.png"), File("bkt", "/path/img.png"))
+        self.assertEqual(_as_file("bkt://path"), File("bkt", "/path"))
+        self.assertEqual(_as_file('f"bkt:/path"'), File("bkt", "/path"))
+
+    def test_http_and_junk(self):
+        self.assertIsNone(_as_file("http://x/y.png"))
+        self.assertIsNone(_as_file("plain"))
+        self.assertIsNone(_as_file(None))
+        self.assertIsNone(_as_file(123))
 
 
 class SafeLiteralSegmentTests(unittest.TestCase):
@@ -100,7 +128,7 @@ class QueueRidTests(unittest.TestCase):
 
     def test_preserves_string_key(self):
         q = _queue_rid("marker_views:abc123")
-        self.assertEqual(q.table_name, "embedding_queue")
+        self.assertEqual(getattr(q, "table_name", None) or getattr(q, "table", None), "embedding_queue")
         self.assertEqual(q.id, "abc123")
 
 

@@ -9,11 +9,11 @@ from queue import Empty
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from PIL import Image
 from pydantic import BaseModel
-from surrealdb import AsyncSurreal, AsyncWsSurrealConnection, RecordID
+from surrealdb import AsyncSurreal, AsyncSurrealConnection, File, RecordID
 from surrealdb.errors import InvalidRecordIdError
 
 from src.config import Settings, get_settings
@@ -38,6 +38,10 @@ worker = ModelWorker(state)
 
 job_queue: asyncio.Queue[RecordID] = asyncio.Queue(maxsize=settings.queue_capacity)
 
+# Counts for the current busy wave; reset when the queue returns to idle.
+_batch_ok = 0
+_batch_err = 0
+
 
 def _setup_runtime(s: Settings) -> None:
     os.environ.setdefault("HF_HOME", s.hf_home)
@@ -51,26 +55,59 @@ def _setup_runtime(s: Settings) -> None:
             setup_process_prio()
 
 
-def _build_proxy_url(raw: str | None) -> str | None:
-    if not raw:
+def _as_file(raw: str | File | None) -> File | None:
+    """Coerce a record field into a SurrealDB ``File``, or ``None`` if it isn't one.
+
+    Accepts a native ``File`` (decoded by the SDK from CBOR tag 55) or a string
+    form ``bucket:/key`` / ``bucket://key`` (and the optional ``f\"...\"`` wrapper).
+    HTTP(S) URLs and anything else return ``None``.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, File):
+        return raw
+    if not isinstance(raw, str):
         return None
     if raw.startswith(("http://", "https://")):
-        return raw
-    # SurrealDB file pointer: "bucket:/path" -> our /files proxy.
-    bucket, sep, path = raw.partition(":")
-    if not sep:
-        return raw
-    path = path.lstrip("/")
-    if not bucket or not path:
         return None
-    return f"http://127.0.0.1:{settings.fastapi_port}/files/{bucket}/{path}"
+
+    s = raw.strip()
+    if len(s) >= 3 and s[0] == "f" and s[1] in "'\"" and s[-1] == s[1]:
+        s = s[2:-1]
+
+    bucket, sep, path = s.partition(":")
+    if not sep or not bucket or not path:
+        return None
+    # "bucket://key" and "bucket:/key" both collapse to key "/key".
+    while path.startswith("//"):
+        path = path[1:]
+    if not path.startswith("/"):
+        path = f"/{path}"
+    if path == "/":
+        return None
+    return File(bucket, path)
 
 
-# Keeping a file pointer embedded in SurrealQL requires only that neither the
-# bucket nor path can break out of the `f"..."` literal. That means no `"`,
-# no backslash, no whitespace/control chars. Everything else is inert inside a
-# string and needs no further character whitelisting.
-def _safe_literal_segment(seg: str) -> bool:
+def _build_proxy_url(raw: str | File | None) -> str | None:
+    if not raw:
+        return None
+    if isinstance(raw, str) and raw.startswith(("http://", "https://")):
+        return raw
+    ref = _as_file(raw)
+    if ref is None:
+        # Bare non-pointer strings keep their value; a broken ``bucket:…`` form
+        # is treated as missing rather than passed through.
+        if isinstance(raw, str) and ":" not in raw:
+            return raw
+        return None
+    path = ref.key.lstrip("/")
+    if not path:
+        return None
+    return f"http://127.0.0.1:{settings.fastapi_port}/files/{ref.bucket}/{path}"
+
+
+def _safe_path_segment(seg: str) -> bool:
+    """Reject path/bucket pieces that shouldn't reach the files API."""
     if not seg:
         return False
     for ch in seg:
@@ -79,11 +116,15 @@ def _safe_literal_segment(seg: str) -> bool:
     return True
 
 
-async def _connect_db(s: Settings) -> Any:
+# Back-compat alias used by unit tests.
+_safe_literal_segment = _safe_path_segment
+
+
+async def _connect_db(s: Settings) -> AsyncSurrealConnection:
     db = AsyncSurreal(s.surrealdb_host)
     try:
         await db.signin({"username": s.surrealdb_user, "password": s.surrealdb_password})
-        await db.use(namespace=s.surrealdb_namespace, database=s.surrealdb_name)
+        await db.use(s.surrealdb_namespace, s.surrealdb_name)
     except Exception:
         await _close_quietly(db)
         raise
@@ -98,18 +139,24 @@ async def _close_quietly(db: Any) -> None:
 
 
 async def _read_file_bytes(db: Any, bucket: str, path: str) -> bytes | None:
-    if not _safe_literal_segment(bucket) or "/" in bucket:
+    """Read file bytes from a SurrealDB bucket via the SDK ``files`` helper.
+
+    ``path`` may be with or without a leading ``/``. Uses ``db.files.get(File)``
+    so the pointer is bound as CBOR tag 55 — no SurrealQL string interpolation.
+    """
+    if not _safe_path_segment(bucket) or "/" in bucket:
         raise ValueError("invalid bucket name")
-    if not _safe_literal_segment(path):
+    key_body = path.lstrip("/")
+    if not _safe_path_segment(key_body):
         raise ValueError("invalid file path")
 
-    result = await db.query(f'RETURN f"{bucket}:/{path}".get();')
-    if result is None:
+    data = await db.files.get(File(bucket, key_body))
+    # Empty blob is treated as missing so the model never sees a zero-byte file.
+    if data is None:
         return None
-    if isinstance(result, bytes):
-        # Empty blob is treated as missing so the model never sees a zero-byte file.
-        return result or None
-    raise ValueError(f"unexpected file result: {type(result).__name__}")
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        raise ValueError(f"unexpected file result: {type(data).__name__}")
+    return bytes(data) or None
 
 
 class Connection:
@@ -122,7 +169,7 @@ class Connection:
     def __init__(self, s: Settings, state: ServiceState):
         self.settings = s
         self.state = state
-        self.db: AsyncWsSurrealConnection | None = None
+        self.db: AsyncSurrealConnection | None = None
         self.ready = asyncio.Event()
         self._announced_down = False
 
@@ -186,6 +233,10 @@ class Broadcaster:
         self._subs: set[asyncio.Queue] = set()
         self._closed = False
 
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
     def subscribe(self) -> asyncio.Queue:
         if self._closed:
             raise RuntimeError("broadcaster closed")
@@ -203,7 +254,7 @@ class Broadcaster:
             q.put_nowait(data)
 
     def close(self) -> None:
-        """Force-disconnect all SSE clients (used on app shutdown)."""
+        """Force-disconnect all SSE clients (used on app shutdown / reload)."""
         self._closed = True
         for q in list(self._subs):
             try:
@@ -256,34 +307,45 @@ def _queue_rid(rid: str) -> RecordID:
 
 
 async def _set_queue_status(
-    conn: Connection, rid: str, status: str, error: str | None = None
+    conn: Connection,
+    rid: str,
+    status: str,
+    error: str | None = None,
+    *,
+    version: Any = None,
 ) -> None:
     """Reflect a task's status onto its embedding_queue row (best-effort).
 
     Never raises: a failed status write must not stall the dispatch/persist loop.
+    On success, ``version`` (marker_views.version sampled at dispatch) is stored
+    as ``version_snapshot`` so the app can detect out-of-sync embeddings.
     """
     try:
         queue_rid = _queue_rid(rid)
     except Exception as e:
         logger.warning("Cannot derive embedding_queue id for %s: %s", rid, e)
         return
+    payload: dict[str, Any] = {
+        "status": _QUEUE_STATUS.get(status, status),
+        "error_message": error,
+    }
+    if version is not None:
+        payload["version_snapshot"] = version
     try:
         await conn.ready.wait()
-        await conn.db.merge(
-            queue_rid,
-            {"status": _QUEUE_STATUS.get(status, status), "error_message": error},
-        )
+        # SDK 3.x: merge is a clause on update(), not a top-level method.
+        await conn.db.update(queue_rid).merge(payload)
     except Exception as e:
         logger.warning("Failed to update embedding_queue status for %s: %s", rid, e)
 
 
-async def _image_bytes(conn: Connection, raw: str) -> bytes | None:
+async def _image_bytes(conn: Connection, raw: str | File) -> bytes | None:
     """Load raw image bytes from a record's image_url.
 
-    Handles both bucket file pointers ("bucket:/path", read straight from the DB)
-    and http(s) URLs.
+    Handles bucket file pointers (``File`` or ``\"bucket:/path\"``, read from the
+    DB) and http(s) URLs.
     """
-    if raw.startswith(("http://", "https://")):
+    if isinstance(raw, str) and raw.startswith(("http://", "https://")):
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.get(raw)
@@ -292,18 +354,20 @@ async def _image_bytes(conn: Connection, raw: str) -> bytes | None:
         except Exception as e:
             logger.warning("Failed to fetch image %s: %s", raw, e)
             return None
-    bucket, sep, path = raw.partition(":")
-    path = path.lstrip("/")
-    if not sep or not bucket or not path:
+
+    ref = _as_file(raw)
+    if ref is None:
         return None
     try:
-        return await _read_file_bytes(conn.db, bucket, path)
+        return await _read_file_bytes(conn.db, ref.bucket, ref.key)
     except Exception as e:
         logger.warning("Failed to read image %s: %s", raw, e)
         return None
 
 
-async def _prepare_image(conn: Connection, raw: str | None) -> Image.Image | None:
+async def _prepare_image(
+    conn: Connection, raw: str | File | None
+) -> Image.Image | None:
     """Load a record's image and downscale it (see prepare_image) for encoding."""
     if not raw:
         return None
@@ -317,6 +381,36 @@ async def _prepare_image(conn: Connection, raw: str | None) -> Image.Image | Non
         return None
 
 
+def _queue_idle() -> bool:
+    """True when nothing is waiting, in-flight, or still marked pending."""
+    if not job_queue.empty() or worker.jobs.qsize() > 0:
+        return False
+    return not any(
+        t["status"] in ("queued", "processing") for t in state.all_tasks().values()
+    )
+
+
+def _note_finished(ok: bool) -> None:
+    """Count a terminal task; log once when the whole queue drains."""
+    global _batch_ok, _batch_err
+    if ok:
+        _batch_ok += 1
+    else:
+        _batch_err += 1
+    if not _queue_idle():
+        return
+    logger.info("Queue done: %d ok, %d failed", _batch_ok, _batch_err)
+    broadcaster.publish(
+        {
+            "status": "queue_done",
+            "ok": _batch_ok,
+            "failed": _batch_err,
+        }
+    )
+    _batch_ok = 0
+    _batch_err = 0
+
+
 async def _dispatch(conn: Connection) -> None:
     while True:
         await conn.ready.wait()
@@ -324,19 +418,19 @@ async def _dispatch(conn: Connection) -> None:
         rid = str(rid_obj)
         state.set_task(rid, "processing")
         await _set_queue_status(conn, rid, "processing")
+        broadcaster.publish({"record_id": rid, "status": "processing"})
         logger.info("Processing %s", rid)
 
         try:
+            # SDK 3.x: select(RecordID) returns the record dict or None.
             rec = await conn.db.select(rid_obj)
-            logger.info(rec)
-            if isinstance(rec, list):
-                rec = rec[0] if rec else None
         except Exception as e:
             logger.warning("Failed to select %s: %s", rid, e)
             state.set_task(rid, "error", str(e))
             await _set_queue_status(conn, rid, "error", str(e))
             state.bump(ok=False)
             broadcaster.publish({"record_id": rid, "status": "error", "error": str(e)})
+            _note_finished(ok=False)
             continue
 
         if not rec or not isinstance(rec, dict):
@@ -344,6 +438,7 @@ async def _dispatch(conn: Connection) -> None:
             await _set_queue_status(conn, rid, "error", "record not found")
             state.bump(ok=False)
             broadcaster.publish({"record_id": rid, "status": "error", "error": "record not found"})
+            _note_finished(ok=False)
             continue
 
         text = (rec.get("generated_description") or "").strip() or None
@@ -354,9 +449,17 @@ async def _dispatch(conn: Connection) -> None:
             await _set_queue_status(conn, rid, "error", "no text or image to embed")
             state.bump(ok=False)
             broadcaster.publish({"record_id": rid, "status": "error", "error": "no text or image to embed"})
+            _note_finished(ok=False)
             continue
 
-        worker.jobs.put(ModelJob(record_id=rid, text=text, image=image))
+        worker.jobs.put(
+            ModelJob(
+                record_id=rid,
+                text=text,
+                image=image,
+                version=rec.get("version"),
+            )
+        )
 
 
 async def _persist(conn: Connection) -> None:
@@ -372,26 +475,31 @@ async def _persist(conn: Connection) -> None:
             await _set_queue_status(conn, rid, "error", result.error)
             state.bump(ok=False)
             broadcaster.publish({"record_id": rid, "status": "error", "error": result.error})
+            _note_finished(ok=False)
             continue
-
-        data: dict[str, Any] = {"embedding": result.embedding}
 
         try:
             await conn.ready.wait()
-            await conn.db.merge(RecordID.parse(rid), data)
+            # Only the vector goes on marker_views. Version snapshot lives on
+            # embedding_queue (SCHEMAFULL has no embedding_version field).
+            await conn.db.update(RecordID.parse(rid)).merge(
+                {"embedding": result.embedding}
+            )
         except Exception as e:
             logger.warning("Failed to persist %s: %s", rid, e)
             state.set_task(rid, "error", str(e))
             await _set_queue_status(conn, rid, "error", str(e))
             state.bump(ok=False)
             broadcaster.publish({"record_id": rid, "status": "error", "error": str(e)})
+            _note_finished(ok=False)
             continue
 
         state.set_task(rid, "done")
-        await _set_queue_status(conn, rid, "done")
+        await _set_queue_status(conn, rid, "done", version=result.version)
         state.bump(ok=True)
         broadcaster.publish({"record_id": rid, "status": "done"})
         logger.info("Embedded and saved %s", rid)
+        _note_finished(ok=True)
 
 
 @asynccontextmanager
@@ -409,8 +517,10 @@ async def lifespan(app: FastAPI):
     logger.info("Service ready (model loading in background)")
     yield
 
-    # Drop SSE first so open streams do not block uvicorn shutdown.
+    # Wake SSE generators first so uvicorn reload is not blocked waiting for
+    # clients to drop /queue/stream. Generators poll closed + SHUTDOWN.
     broadcaster.close()
+    await asyncio.sleep(0)  # let generators observe shutdown and exit
     worker.stop()
     for t in (dispatch_task, persist_task, reconnect_task):
         t.cancel()
@@ -446,12 +556,6 @@ async def generate(payload: GenerateRequest):
 
     return {"accepted": accepted, "count": len(accepted)}
 
-# @app.get("/test")
-# async def test():
-#     conn: Connection = app.state.conn
-#     res = await conn.db.query("select * from marker_views")
-#     logger.info(res)
-#     return { "connection": "???" }
 
 @app.post("/encode")
 async def encode(payload: QueryRequest):
@@ -533,7 +637,7 @@ async def get_file(bucket: str, path: str):
 
 
 @app.get("/queue/stream")
-async def queue_stream():
+async def queue_stream(request: Request):
     async def gen():
         try:
             q = broadcaster.subscribe()
@@ -544,7 +648,18 @@ async def queue_stream():
         try:
             yield _sse({"type": "snapshot", "data": {**state.snapshot(), **_queue_info()}})
             while True:
-                msg = await q.get()
+                # Timed wait so we can notice app shutdown / client disconnect
+                # without depending on the peer closing first (uvicorn reload).
+                if broadcaster.closed or await request.is_disconnected():
+                    yield _sse({"type": "shutdown"})
+                    break
+                try:
+                    msg = await asyncio.wait_for(q.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    # SSE comment heartbeat — keeps proxies from buffering and
+                    # gives the loop another chance to see closed/disconnect.
+                    yield ":\n\n"
+                    continue
                 if msg is Broadcaster._SHUTDOWN:
                     yield _sse({"type": "shutdown"})
                     break
@@ -556,7 +671,7 @@ async def queue_stream():
         gen(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },

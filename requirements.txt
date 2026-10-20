@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+httpx
+pillow
+pydantic
+pydantic-settings
+torch
+sentence-transformers
+numpy
+# SurrealDB v3 file pointers (CBOR tag 55 / File / db.files) need the 3.x SDK.
+surrealdb>=3.0.0b10

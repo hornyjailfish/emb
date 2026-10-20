@@ -5,6 +5,7 @@ import threading
 import uuid
 from dataclasses import dataclass
 from queue import Empty, Queue
+from typing import Any
 
 from PIL import Image
 
@@ -27,6 +28,9 @@ class ModelJob:
     record_id: str
     text: str | None
     image: Image.Image | str | None  # prepared PIL image, or a source the model loads
+    # Record `version` sampled at dispatch time; written back as
+    # `embedding_version` on success so the app can detect stale embeddings.
+    version: Any = None
 
 
 @dataclass
@@ -34,6 +38,7 @@ class ModelResult:
     record_id: str
     embedding: list[float] | None
     error: str | None
+    version: Any = None
 
 
 @dataclass
@@ -146,8 +151,7 @@ class ModelWorker:
     def _run(self) -> None:
         self.state.set_model_state("loading")
         try:
-            # self._model = self._load_model()
-            self._model = None
+            self._model = self._load_model()
         except Exception as e:
             logger.exception("Model failed to load")
             self.state.set_model_state("error", str(e))
@@ -211,7 +215,12 @@ class ModelWorker:
             self._model.encode_document, _fused_input(job.text, job.image)
         )
         self.results.put(
-            ModelResult(record_id=job.record_id, embedding=embedding, error=error)
+            ModelResult(
+                record_id=job.record_id,
+                embedding=embedding,
+                error=error,
+                version=job.version,
+            )
         )
 
     def _handle_query(self, job: QueryJob) -> None:
