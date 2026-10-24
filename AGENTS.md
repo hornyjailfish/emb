@@ -100,6 +100,10 @@ The model runs on CPU, so image size is the main cost driver.
   default `262144` px (~512×512) is the model's floor — the fastest CPU
   setting. Raise it for more detail (e.g. `1310720` = 1280 tokens) once you have
   a GPU. This is the single source of truth for the size — don't hardcode it.
+- `settings.disable_image_transform` (env `DISABLE_IMAGE_TRANSFORM`) skips the
+  downscale entirely and passes the raw bytes straight to the model (it accepts
+  bytes directly). `_prepare_image` returns the bytes as-is; the model input
+  types (`ModelJob.image` / `QueryJob.image` / `_fused_input`) accept `bytes`.
 - One job runs at a time, so the prepared image is simply used and dropped (no
   cleanup juggling).
 
@@ -117,14 +121,21 @@ The model runs on CPU, so image size is the main cost driver.
 ## Search
 
 `POST /search` encodes a query (text and/or image — either alone is fine),
-runs cosine similarity over a registered **target**, collapses source rows
-onto a parent entity, and returns top-k parents.
+runs cosine similarity over a registered **target**, keeps the top-k **views**
+above a view-level score cutoff, collapses those onto a parent entity, and
+returns the resulting parents (ranked by best view).
 
 ### Markers target (default)
 
 - Source vectors: `marker_views.embedding`
 - Parent: `marker_views.marker` → `markers`
-- Score: **sum** of matching view cosines (extra views add points)
+- `top_k`: max **views** kept (not parents)
+- `min_score`: view cosine cutoff (default `0.55`); weak views never reach
+  parent aggregation — pass `0` / `-1` to loosen
+- Parent score: `max(sim) + α · log(1 + n_views)` where `n_views` is how many
+  of that marker’s views cleared the gate; `α` is `VIEW_COUNT_ALPHA` in
+  `src/search.py` (default `0.07`). Peak dominates; multi-hit is a small boost
+  (response also includes raw `peak`)
 - Filter: `filters.level` → `marker.level` (record id)
 - Response hydrates parent `level`, `zone`, `closest_shop`, `geometry`
 
@@ -135,6 +146,7 @@ POST /search
   "text": "near the fountain",
   "image_url": null,
   "top_k": 10,
+  "min_score": 0.55,
   "filters": { "level": "levels:ground" }
 }
 ```
@@ -143,14 +155,16 @@ POST /search
 {
   "target": "markers",
   "top_k": 10,
+  "min_score": 0.55,
   "count": 1,
   "results": [
     {
       "id": "markers:abc",
-      "score": 1.42,
+      "peak": 0.91,
+      "score": 0.987,
       "views": [
         { "id": "marker_views:1", "score": 0.91 },
-        { "id": "marker_views:2", "score": 0.51 }
+        { "id": "marker_views:2", "score": 0.60 }
       ],
       "level": "levels:ground",
       "geometry": { "...": "geojson point" }
@@ -170,7 +184,7 @@ collapse, filters (`FilterDef`), and parent columns to hydrate.
 
 - `POST /generate` `{"items": ["marker_views:..."]}` → `202`
 - `POST /encode` `{"text": "..."}` and/or `{"image_url": "..."}` → `{"embedding": [...]}`
-- `POST /search` — cosine search (see Search); text and/or image, `top_k`, filters
+- `POST /search` — cosine search (see Search); text and/or image, `top_k` views, `min_score`, filters
 - `GET /search/targets` — registered targets + filter keys
 - `GET /health`
 - `GET /tasks`, `GET /tasks/{record_id}`
@@ -179,8 +193,13 @@ collapse, filters (`FilterDef`), and parent columns to hydrate.
 
 ## Conventions
 
-- **Record IDs**: parse with `RecordID.parse()` and pass the object to the SDK
-  (parameterized, injection-safe). Never interpolate raw IDs into SurrealQL.
+- **Record IDs**: parse with `src.ids.parse_record_id()` (not bare
+  `RecordID.parse`) and pass the object to the SDK (parameterized,
+  injection-safe). Never interpolate raw IDs into SurrealQL.
+  **Never** use `str(RecordID)` as something you parse back: digit-leading
+  ids render as `table:⟨id⟩`, and `RecordID.parse` keeps the brackets inside
+  `.id`, so `UPDATE` silently no-ops on a missing row. Task keys / logs / SSE
+  use `src.ids.record_key(rid)` (`table:raw_id`, no escapes).
 - **No regex** for validation. Path/bucket segments for the files proxy reject
   `"`, `\`, whitespace, control chars via `_safe_path_segment`.
 - **File pointers**: SurrealDB v3 stores bucket refs as CBOR tag 55. Read with

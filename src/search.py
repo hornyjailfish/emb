@@ -9,17 +9,30 @@ Add a new searchable collection by registering a ``SearchTarget`` in
 - which request ``filters`` map onto SurrealQL predicates;
 - which parent columns to hydrate in the response (``parent_fields``).
 
-Ranking: each parent’s score is the **sum** of its matching view cosine
-scores, so extra views that also match the query add points naturally.
+Ranking: take the top-k **views** above ``min_score``, then collapse onto
+parents. Parent score is peak cosine plus a small multi-hit boost::
+
+    score = max(sim) + α · log(1 + n_views)
+
+so one strong match stays on top, while genuine multi-view support still
+nudges a marker up. Tune α via ``VIEW_COUNT_ALPHA`` (default 0.07).
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
 from surrealdb import RecordID
 from surrealdb.errors import InvalidRecordIdError
+
+from src.ids import parse_record_id, record_key
+
+# Multi-hit boost on parent score: max(sim) + α * log(1 + n_views).
+# Keep small so raw cosine still dominates; bump if multi-view support
+# should matter more.
+VIEW_COUNT_ALPHA: float = 0.07
 
 
 @dataclass(frozen=True)
@@ -48,9 +61,9 @@ class SearchTarget:
     # Columns to SELECT from parent_table when hydrating hits.
     parent_fields: tuple[str, ...] = ()
     filters: tuple[FilterDef, ...] = ()
-    # How many source rows to pull before grouping (top_k * multiplier).
-    candidate_multiplier: int = 8
-    min_candidate_limit: int = 32
+    # Extra headroom when fetching views (usually 1 — top_k is view-level).
+    candidate_multiplier: int = 1
+    min_candidate_limit: int = 1
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +95,29 @@ def get_target(name: str) -> SearchTarget:
     return target
 
 
+def unwrap_query_result(result: Any) -> list[Any]:
+    """Normalize SDK 3 ``query()`` payloads into a flat list of row values.
+
+    A single SurrealQL statement comes back as ``[[row, row, ...]]`` (outer list
+    = statements, inner = rows). Older/simpler responses may already be a flat
+    list of dicts or a lone dict. Without unwrapping, search sees the inner list
+    as a "row", drops it (not a dict with ``score``), and always returns empty.
+    """
+    if result is None:
+        return []
+    if isinstance(result, dict):
+        return [result]
+    if not isinstance(result, list):
+        return []
+    if not result:
+        return []
+    # One or more statement result sets: take the first statement's rows.
+    if isinstance(result[0], list):
+        rows = result[0]
+        return list(rows) if isinstance(rows, list) else []
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Ranking
 # ---------------------------------------------------------------------------
@@ -91,32 +127,78 @@ def _as_id_str(value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, RecordID):
-        return str(value)
+        # Bare table:id — str(RecordID) wraps digit-leading ids in ⟨⟩.
+        return record_key(value)
     if isinstance(value, dict):
         # Surreal sometimes returns nested record objects
         tb = value.get("tb") or value.get("table")
         rid = value.get("id")
         if tb is not None and rid is not None:
-            return f"{tb}:{rid}"
-    return str(value)
+            return record_key(f"{tb}:{rid}")
+    s = str(value)
+    if ":" in s:
+        try:
+            return record_key(s)
+        except (InvalidRecordIdError, ValueError, TypeError):
+            return s
+    return s
+
+
+def filter_top_views(
+    rows: list[dict[str, Any]],
+    *,
+    top_k: int,
+    min_score: float,
+) -> list[dict[str, Any]]:
+    """Keep scored rows at/above ``min_score``, capped at ``top_k``.
+
+    Assumes ``rows`` are already ordered by score descending (as produced by
+    ``build_candidate_query``). Once a row falls below the cutoff, the rest
+    are skipped.
+    """
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict) or "score" not in row:
+            continue
+        try:
+            score = float(row["score"])
+        except (TypeError, ValueError):
+            continue
+        if score < min_score:
+            # Query is ORDER BY score DESC — remaining rows cannot qualify.
+            break
+        out.append(row)
+        if len(out) >= max(0, top_k):
+            break
+    return out
+
+
+def parent_score(peak: float, n_views: int, *, alpha: float = VIEW_COUNT_ALPHA) -> float:
+    """Combine peak view cosine with a diminishing multi-hit boost."""
+    n = max(0, int(n_views))
+    return float(peak) + float(alpha) * math.log(1 + n)
 
 
 def aggregate_by_parent(
     rows: list[dict[str, Any]],
     *,
     parent_field: str,
-    top_k: int,
+    alpha: float = VIEW_COUNT_ALPHA,
 ) -> list[dict[str, Any]]:
-    """Group source hits by parent and rank by summed cosine scores.
+    """Group already-selected view hits by parent; rank by peak + multi-hit.
 
-    Each row needs at least ``parent_field`` and ``score``. Optional ``id`` is
-    kept under ``views`` so the client can see which embeddings contributed.
+    Caller is expected to pass **top-k views** (after ``min_score``). Each row
+    needs ``parent_field`` + ``score``. Optional ``id`` is kept under ``views``.
 
-    Multiple views of the same parent **add** their scores — extra matching
-    views push the parent higher.
+    Parent score::
+
+        max(view_sim) + α * log(1 + n_views)
+
+    Peak keeps a single confident hit ahead of many weak ones; the log term
+    gives a small bump when several views of the same marker all cleared the
+    view gate. ``alpha`` defaults to ``VIEW_COUNT_ALPHA``.
     """
     groups: dict[str, dict[str, Any]] = {}
-    order: list[str] = []
 
     for row in rows:
         parent = _as_id_str(row.get(parent_field))
@@ -129,12 +211,12 @@ def aggregate_by_parent(
         if parent not in groups:
             groups[parent] = {
                 "id": parent,
-                "score": 0.0,
+                "peak": score,
                 "views": [],
             }
-            order.append(parent)
         g = groups[parent]
-        g["score"] += score
+        if score > g["peak"]:
+            g["peak"] = score
         view_id = row.get("id")
         g["views"].append(
             {
@@ -143,14 +225,37 @@ def aggregate_by_parent(
             }
         )
 
+    # Best view first within each parent; finalize peak+boost score.
+    for g in groups.values():
+        g["views"].sort(key=lambda v: v["score"], reverse=True)
+        g["score"] = parent_score(g["peak"], len(g["views"]), alpha=alpha)
+
     ranked = sorted(groups.values(), key=lambda g: g["score"], reverse=True)
-    # Stable tie-break by first-seen order for equal scores
-    return ranked[: max(0, top_k)]
+    return ranked
 
 
 # ---------------------------------------------------------------------------
 # Query building
 # ---------------------------------------------------------------------------
+
+
+def _parse_filter_record_id(value: Any) -> RecordID:
+    """Parse a filter value into a ``RecordID``, coercing numeric ids to ``int``.
+
+    Surreal stores ``levels:-1`` with an integer id ``-1``. String parse keeps
+    the segment as ``"-1"``, and ``levels:-1`` (str) never equals ``levels:-1``
+    (int) — filters then match nothing. Coerce plain integer segments (optional
+    leading ``-``) so equality works. Also strips SurrealQL ``⟨⟩`` escapes.
+    """
+    rid = parse_record_id(value if isinstance(value, RecordID) else str(value).strip())
+
+    id_part = rid.id
+    if isinstance(id_part, str):
+        s = id_part.strip()
+        # Plain decimal int only — leave strings/UUIDs alone.
+        if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
+            return RecordID(rid.table_name, int(s))
+    return rid
 
 
 def bind_filters(
@@ -179,8 +284,8 @@ def bind_filters(
         param = f"f_{key}"
         if fdef.kind == "record":
             try:
-                params[param] = RecordID.parse(str(value).strip())
-            except (InvalidRecordIdError, ValueError) as e:
+                params[param] = _parse_filter_record_id(value)
+            except (InvalidRecordIdError, ValueError, TypeError) as e:
                 raise ValueError(f"invalid record id for filter {key!r}: {value}") from e
         else:
             params[param] = value
@@ -193,14 +298,22 @@ def build_candidate_query(
     *,
     filter_clauses: list[str],
     limit: int,
+    min_score: float | None = None,
 ) -> str:
-    """SurrealQL that scores source rows by cosine similarity to ``$query``."""
+    """SurrealQL that scores source rows by cosine similarity to ``$query``.
+
+    When ``min_score`` is set, the cosine expression is also applied in WHERE
+    against ``$min_score`` so LIMIT counts only qualifying views.
+    """
+    score_expr = f"vector::similarity::cosine({target.embedding_field}, $query)"
     where = [f"{target.embedding_field} IS NOT NONE", *filter_clauses]
+    if min_score is not None:
+        where.append(f"{score_expr} >= $min_score")
     where_sql = " AND ".join(where)
     parent_sel = f", {target.parent_field}" if target.parent_field else ""
     return (
         f"SELECT id{parent_sel}, "
-        f"vector::similarity::cosine({target.embedding_field}, $query) AS score "
+        f"{score_expr} AS score "
         f"FROM {target.source_table} "
         f"WHERE {where_sql} "
         f"ORDER BY score DESC "
@@ -209,6 +322,7 @@ def build_candidate_query(
 
 
 def candidate_limit(target: SearchTarget, top_k: int) -> int:
+    """How many source views to pull — ``top_k`` is view-level."""
     return max(target.min_candidate_limit, int(top_k) * target.candidate_multiplier)
 
 
@@ -234,13 +348,11 @@ async def hydrate_parents(
     # $ids is an array of record ids; Surreal resolves them.
     sql = f"SELECT {fields} FROM $ids"
     try:
-        rows = await db.query(sql, {"ids": ids})
+        raw = await db.query(sql, {"ids": ids})
     except Exception:
         return hits
 
-    if not isinstance(rows, list):
-        return hits
-
+    rows = unwrap_query_result(raw)
     by_id = {_as_id_str(r.get("id")): r for r in rows if isinstance(r, dict)}
     out: list[dict[str, Any]] = []
     for h in hits:

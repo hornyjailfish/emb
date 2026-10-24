@@ -27,7 +27,7 @@ class QueryError(RuntimeError):
 class ModelJob:
     record_id: str
     text: str | None
-    image: Image.Image | str | None  # prepared PIL image, or a source the model loads
+    image: Image.Image | bytes | str | None  # prepared PIL image, raw bytes, or a source the model loads
     # Record `version` sampled at dispatch time; written back as
     # `embedding_version` on success so the app can detect stale embeddings.
     version: Any = None
@@ -45,7 +45,7 @@ class ModelResult:
 class QueryJob:
     query_id: str
     text: str | None
-    image: Image.Image | str | None  # prepared PIL image, or a source the model loads
+    image: Image.Image | bytes | str | None  # prepared PIL image, raw bytes, or a source the model loads
     normalize: bool = False
 
 
@@ -74,8 +74,8 @@ def _normalize(vec: list[float] | None) -> list[float] | None:
 
 
 def _fused_input(
-    text: str | None, image: Image.Image | str | None
-) -> str | Image.Image | tuple | None:
+    text: str | None, image: Image.Image | bytes | str | None
+) -> str | Image.Image | bytes | tuple | None:
     """Build the model input.
 
     A (text, image) tuple fuses both modalities into ONE embedding in a single
@@ -239,8 +239,8 @@ class ModelWorker:
     def encode_query(
         self,
         text: str | None,
-        image: Image.Image | str | None,
-        timeout: float = 60.0,
+        image: Image.Image | bytes | str | None,
+        timeout: float = 0.0,
         normalize: bool = False,
     ) -> list[float] | None:
         """Block the caller until the worker encodes a query and returns it.
@@ -248,11 +248,16 @@ class ModelWorker:
         Runs on the worker thread but is safe to call from the event loop via
         `asyncio.to_thread`. Returns the single fused query embedding (None if
         no input was given). `normalize` L2-normalizes the returned vector.
+
+        ``timeout`` <= 0 means wait forever (no timeout).
         """
         if self._stop.is_set():
             raise ModelNotReadyError("model worker is stopped")
         if not self.state.model_ready():
             raise ModelNotReadyError(f"model not ready (state: {self.state.model_state})")
+
+        # Condition.wait_for(timeout=None) blocks indefinitely.
+        wait_timeout: float | None = None if timeout is None or timeout <= 0 else float(timeout)
 
         query_id = uuid.uuid4().hex
         with self._query_cond:
@@ -260,12 +265,16 @@ class ModelWorker:
             self.query_jobs.put(QueryJob(query_id=query_id, text=text, image=image, normalize=normalize))
             ok = self._query_cond.wait_for(
                 lambda: query_id in self._query_results,
-                timeout=timeout,
+                timeout=wait_timeout,
             )
             result = self._query_results.pop(query_id, None)
 
         if not ok or result is None:
-            raise TimeoutError("query encoding timed out")
+            raise TimeoutError(
+                f"query encoding timed out after {timeout}s"
+                if wait_timeout is not None
+                else "query encoding timed out"
+            )
         if result.error:
             raise QueryError(result.error)
         return result.embedding

@@ -48,10 +48,19 @@ def setup_process_prio():
         import win32api
         import win32con
         import win32process
+        priority = win32process.BELOW_NORMAL_PRIORITY_CLASS
+        label = {
+            win32process.BELOW_NORMAL_PRIORITY_CLASS: "BELLOW NORMAL",
+            win32process.ABOVE_NORMAL_PRIORITY_CLASS: "ABOVE NORMAL",
+            win32process.HIGH_PRIORITY_CLASS: "HIGH",
+            win32process.IDLE_PRIORITY_CLASS: "IDLE",
+            win32process.NORMAL_PRIORITY_CLASS: "NORMAL",
+            win32process.REALTIME_PRIORITY_CLASS: "REALTIME",
+        }
         pid = win32api.GetCurrentProcessId()
         handle = win32api.OpenProcess(win32con.PROCESS_ALL_ACCESS, True, pid)
-        win32process.SetPriorityClass(handle, win32process.IDLE_PRIORITY_CLASS)
-        logger.info("Системный приоритет процесса успешно снижен до IDLE.")
+        win32process.SetPriorityClass(handle, priority)
+        logger.info(f"Системный приоритет процесса успeшно установлен {label[priority]}.")
 
 def check_deps():
     if missing_libs:
