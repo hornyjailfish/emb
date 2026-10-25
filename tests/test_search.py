@@ -168,15 +168,27 @@ class QueryBuildTests(unittest.TestCase):
         sql = build_candidate_query(
             target, filter_clauses=clauses, limit=40, min_score=0.55
         )
-        self.assertIn("vector::similarity::cosine(embedding, $query)", sql)
-        self.assertIn("FROM marker_views", sql)
-        self.assertIn("marker.level = $f_level", sql)
         self.assertIn(
-            "vector::similarity::cosine(embedding, $query) >= $min_score", sql
+            "vector::similarity::cosine(embedding_jina, $query)", sql
+        )
+        self.assertIn("FROM embeddings", sql)
+        self.assertIn("data AS id", sql)
+        self.assertIn("data.marker AS marker", sql)
+        self.assertIn("data.marker.level = $f_level", sql)
+        self.assertIn(
+            "vector::similarity::cosine(embedding_jina, $query) >= $min_score",
+            sql,
         )
         self.assertIn("ORDER BY score DESC", sql)
         self.assertIn("LIMIT 40", sql)
-        self.assertIn("marker", sql)
+
+    def test_vpr_target_uses_megaloc_field(self) -> None:
+        target = get_target("markers_vpr")
+        sql = build_candidate_query(
+            target, filter_clauses=[], limit=5, min_score=None
+        )
+        self.assertIn("embedding_megaloc", sql)
+        self.assertIn("FROM embeddings", sql)
 
     def test_candidate_limit_is_view_level_top_k(self) -> None:
         target = get_target("markers")
@@ -187,9 +199,18 @@ class QueryBuildTests(unittest.TestCase):
 class RegistryTests(unittest.TestCase):
     def test_markers_target_registered(self) -> None:
         t = get_target("markers")
-        self.assertEqual(t.source_table, "marker_views")
+        self.assertEqual(t.source_table, "embeddings")
+        self.assertEqual(t.embedding_field, "embedding_jina")
         self.assertEqual(t.parent_field, "marker")
+        self.assertEqual(t.parent_expr, "data.marker")
+        self.assertEqual(t.id_expr, "data")
+        self.assertEqual(t.query_backend, "jina")
         self.assertIn("level", [f.key for f in t.filters])
+
+    def test_markers_vpr_target_registered(self) -> None:
+        t = get_target("markers_vpr")
+        self.assertEqual(t.embedding_field, "embedding_megaloc")
+        self.assertEqual(t.query_backend, "megaloc")
 
     def test_unknown_target(self) -> None:
         with self.assertRaises(KeyError):

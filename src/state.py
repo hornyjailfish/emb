@@ -18,7 +18,7 @@ class ServiceState:
         self.db_error: str | None = None
         self.processed = 0
         self.errors = 0
-        # record_id -> {"status": queued|processing|done|error, "error": str|None}
+        # record_id -> {status, error, embedding?, kind?}
         self._tasks: dict[str, dict] = {}
 
     def set_model_state(self, state: str, error: str | None = None) -> None:
@@ -35,9 +35,33 @@ class ServiceState:
             self.db_connected = connected
             self.db_error = error
 
-    def set_task(self, record_id: str, status: str, error: str | None = None) -> None:
+    def set_task(
+        self,
+        record_id: str,
+        status: str,
+        error: str | None = None,
+        *,
+        embedding: list[float] | None = None,
+        kind: str | None = None,
+        clear_embedding: bool = False,
+    ) -> None:
         with self._lock:
-            self._tasks[record_id] = {"status": status, "error": error}
+            prev = self._tasks.get(record_id) or {}
+            task: dict = {
+                "status": status,
+                "error": error,
+            }
+            # Preserve kind / embedding across status transitions unless cleared.
+            k = kind if kind is not None else prev.get("kind")
+            if k is not None:
+                task["kind"] = k
+            if clear_embedding:
+                pass
+            elif embedding is not None:
+                task["embedding"] = embedding
+            elif "embedding" in prev and status == "done":
+                task["embedding"] = prev["embedding"]
+            self._tasks[record_id] = task
 
     def get_task(self, record_id: str) -> dict | None:
         with self._lock:
@@ -46,7 +70,15 @@ class ServiceState:
 
     def all_tasks(self) -> dict[str, dict]:
         with self._lock:
-            return {rid: dict(t) for rid, t in self._tasks.items()}
+            # Omit bulky embeddings from the full dump — fetch per-task for those.
+            out: dict[str, dict] = {}
+            for rid, t in self._tasks.items():
+                row = {k: v for k, v in t.items() if k != "embedding"}
+                if "embedding" in t:
+                    row["has_embedding"] = True
+                    row["dim"] = len(t["embedding"]) if t["embedding"] is not None else 0
+                out[rid] = row
+            return out
 
     def bump(self, ok: bool = True) -> None:
         with self._lock:

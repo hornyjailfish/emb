@@ -7,6 +7,7 @@ import os
 import sys
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, replace
 from queue import Empty
 from typing import Any
 from urllib.parse import unquote_to_bytes
@@ -39,7 +40,9 @@ from src.search import (
 )
 from src.state import ServiceState
 from src.utils import check_deps, setup_logging, setup_process_prio
+from src.preprocess import TransformMode
 from src.worker import (
+    BackendMismatchError,
     ModelJob,
     ModelNotReadyError,
     ModelWorker,
@@ -57,6 +60,19 @@ state = ServiceState()
 worker = ModelWorker(state)
 
 job_queue: asyncio.Queue[RecordID] = asyncio.Queue(maxsize=settings.queue_capacity)
+
+# VPR async jobs. Free-form client ids stay in-memory only; when ``task_id``
+# is a marker_views record the result is upserted onto ``embeddings`` and the
+# matching ``embedding_queue`` row is mirrored (same as the Jina path).
+@dataclass
+class VprQueueItem:
+    task_id: str
+    # None → load image_url from the marker_views row (DB-backed jobs only).
+    image_url: str | File | None = None
+    transform: str | None = None
+
+
+vpr_queue: asyncio.Queue[VprQueueItem] = asyncio.Queue(maxsize=settings.queue_capacity)
 
 # Counts for the current busy wave; reset when the queue returns to idle.
 _batch_ok = 0
@@ -448,12 +464,13 @@ def _queue_info() -> dict:
     }
 
 
-# The embedding_queue row for a marker_views record shares its record key: the
-# add_embedding_task event does `UPSERT type::record("embedding_queue",
-# record::id($after.id))`, so marker_views:abc maps to embedding_queue:abc. Its
-# `status` column is the enum 'pending' | 'processing' | 'failed' | 'done' and
-# `error_message` holds the failure reason. We mirror the in-memory task state
-# onto that row so the queue reflects progress durably.
+# The embedding_queue / embeddings rows for a marker_views record share its
+# record key: the app's add_embedding_task event does
+# `UPSERT type::record("embedding_queue", record::id($after.id))`, so
+# marker_views:abc maps to embedding_queue:abc and embeddings:abc.
+# Queue `status` is 'pending' | 'processing' | 'failed' | 'done'; we mirror
+# in-memory task state onto that row. Vectors land on ``embeddings``
+# (embedding_jina / embedding_megaloc) — never on marker_views.
 _QUEUE_STATUS = {
     "queued": "pending",
     "processing": "processing",
@@ -465,6 +482,19 @@ _QUEUE_STATUS = {
 def _queue_rid(rid: str) -> RecordID:
     """Map a marker_views record id to its embedding_queue record id."""
     return RecordID("embedding_queue", parse_record_id(rid).id)
+
+
+def _embeddings_rid(rid: str) -> RecordID:
+    """Map a marker_views record id to its embeddings record id."""
+    return RecordID("embeddings", parse_record_id(rid).id)
+
+
+def _is_marker_view_id(rid: str) -> bool:
+    """True when ``rid`` parses as a ``marker_views`` record."""
+    try:
+        return parse_record_id(rid).table_name == "marker_views"
+    except Exception:
+        return False
 
 
 async def _set_queue_status(
@@ -514,6 +544,35 @@ async def _set_queue_status(
             mapped,
             e,
         )
+
+
+async def _write_embedding(
+    conn: Connection,
+    marker_views_rid: str,
+    embedding: list[float],
+    *,
+    field: str,
+    model: str,
+) -> None:
+    """UPSERT the vector onto ``embeddings:{same_id}`` for a marker_views row.
+
+    Writes only ``field`` (embedding_jina | embedding_megaloc), ``model``, and
+    ``data`` (REFERENCE → marker_views). Merge leaves the other backend's
+    vector intact. Raises on failure so the caller can mark the task failed.
+    """
+    mv = parse_record_id(marker_views_rid)
+    emb_rid = _embeddings_rid(marker_views_rid)
+    payload = {
+        field: embedding,
+        "model": model,
+        "data": mv,
+    }
+
+    async def _upsert(db: AsyncSurrealConnection) -> None:
+        # upsert+merge: create row if missing; only touch the named fields.
+        await db.upsert(emb_rid).merge(payload)
+
+    await conn.run(_upsert, retries=3)
 
 
 def _decode_data_url(raw: str) -> bytes | None:
@@ -657,9 +716,55 @@ async def _prepare_image(
     return img
 
 
+def _backend() -> str:
+    return (settings.model_backend or "megaloc").strip().lower()
+
+
+def _is_megaloc() -> bool:
+    return _backend() in ("megaloc", "vpr")
+
+
+def _is_jina() -> bool:
+    return _backend() in ("jina", "sentence-transformers", "st")
+
+
+def _require_jina() -> None:
+    if not _is_jina():
+        raise HTTPException(
+            503,
+            f"jina endpoints require MODEL_BACKEND=jina (current: {_backend()})",
+        )
+
+
+def _require_megaloc() -> None:
+    if not _is_megaloc():
+        raise HTTPException(
+            503,
+            f"vpr endpoints require MODEL_BACKEND=megaloc (current: {_backend()})",
+        )
+
+
+def _parse_transform(raw: str | None) -> str | None:
+    """Validate optional VPR transform override; None → settings default."""
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        return TransformMode(str(raw).strip().lower()).value
+    except ValueError as e:
+        raise HTTPException(
+            422,
+            f"invalid transform {raw!r}; expected "
+            f"{', '.join(m.value for m in TransformMode)}",
+        ) from e
+
+
 def _queue_idle() -> bool:
     """True when nothing is waiting, in-flight, or still marked pending."""
-    if not job_queue.empty() or worker.jobs.qsize() > 0:
+    if (
+        not job_queue.empty()
+        or not vpr_queue.empty()
+        or worker.jobs.qsize() > 0
+    ):
         return False
     return not any(
         t["status"] in ("queued", "processing") for t in state.all_tasks().values()
@@ -758,15 +863,15 @@ async def _persist(conn: Connection) -> None:
             continue
 
         try:
-            # Only the vector goes on marker_views. Version snapshot lives on
-            # embedding_queue (SCHEMAFULL has no embedding_version field).
-            # run() recovers from token expiry during long CPU embeds.
-            rid_obj = parse_record_id(rid)
-
-            async def _merge_embedding(db: AsyncSurrealConnection) -> None:
-                await db.update(rid_obj).merge({"embedding": result.embedding})
-
-            await conn.run(_merge_embedding, retries=3)
+            # Vectors live on ``embeddings`` (embedding_jina), not marker_views.
+            # Version snapshot still goes to embedding_queue on success.
+            await _write_embedding(
+                conn,
+                rid,
+                result.embedding or [],
+                field="embedding_jina" if settings.model_backend=="jina" else "embedding_megaloc",
+                model=settings.model,
+            )
         except Exception as e:
             logger.warning("Failed to persist %s: %s", rid, e)
             state.set_task(rid, "error", str(e))
@@ -780,7 +885,190 @@ async def _persist(conn: Connection) -> None:
         await _set_queue_status(conn, rid, "done", version=result.version)
         state.bump(ok=True)
         broadcaster.publish({"record_id": rid, "status": "done"})
-        logger.info("Embedded and saved %s", rid)
+        logger.info("Embedded and saved %s → embeddings.embedding_jina", rid)
+        _note_finished(ok=True)
+
+
+async def _load_vpr_image(
+    conn: Connection, raw: str | File | None
+) -> Image.Image | bytes | None:
+    """Load image bytes for VPR. Geometry + ImageNet norm run on the worker."""
+    if not raw:
+        return None
+    ref = _image_ref_log(raw)
+    t0 = time.perf_counter()
+    data = await _image_bytes(conn, raw)
+    if not data:
+        logger.info(
+            "VPR image skip %s: no bytes (%.0fms)",
+            ref,
+            (time.perf_counter() - t0) * 1000,
+        )
+        return None
+    logger.info(
+        "VPR image loaded %s bytes=%d (%.0fms)",
+        ref,
+        len(data),
+        (time.perf_counter() - t0) * 1000,
+    )
+    return data
+
+
+async def _vpr_dispatch(conn: Connection) -> None:
+    """Drain vpr_queue → worker.jobs.
+
+    marker_views-backed jobs also mirror ``embedding_queue`` and sample
+    ``version`` for the post-embed snapshot. Free-form client ids skip DB.
+    """
+    while True:
+        item = await vpr_queue.get()
+        rid = item.task_id
+        persist = _is_marker_view_id(rid)
+        state.set_task(rid, "processing", kind="vpr")
+        broadcaster.publish({"record_id": rid, "status": "processing", "kind": "vpr"})
+        logger.info("VPR processing %s persist=%s", rid, persist)
+
+        if persist:
+            await _set_queue_status(conn, rid, "processing")
+
+        version: Any = None
+        image_src: str | File | None = item.image_url
+
+        try:
+            # marker_views row: always touch DB (version + optional image load).
+            if persist:
+                await conn.ready.wait()
+                rid_obj = parse_record_id(rid)
+
+                async def _select(db: AsyncSurrealConnection):
+                    return await db.select(rid_obj)
+
+                rec = await conn.run(_select, retries=2)
+                if isinstance(rec, list):
+                    rec = rec[0] if rec else None
+                if not isinstance(rec, dict):
+                    raise ValueError("record not found")
+                version = rec.get("version")
+                if image_src is None:
+                    image_src = rec.get("image_url")
+            elif isinstance(image_src, File) or _as_file(
+                image_src if isinstance(image_src, str) else None
+            ):
+                # File pointers need DB; http/data URLs do not.
+                await conn.ready.wait()
+
+            image = await _load_vpr_image(conn, image_src)
+        except Exception as e:
+            logger.warning("VPR load failed %s: %s", rid, e)
+            state.set_task(rid, "error", str(e), kind="vpr")
+            if persist:
+                await _set_queue_status(conn, rid, "error", str(e))
+            state.bump(ok=False)
+            broadcaster.publish(
+                {"record_id": rid, "status": "error", "error": str(e), "kind": "vpr"}
+            )
+            _note_finished(ok=False)
+            continue
+
+        if image is None:
+            err = "no image to encode"
+            state.set_task(rid, "error", err, kind="vpr")
+            if persist:
+                await _set_queue_status(conn, rid, "error", err)
+            state.bump(ok=False)
+            broadcaster.publish(
+                {"record_id": rid, "status": "error", "error": err, "kind": "vpr"}
+            )
+            _note_finished(ok=False)
+            continue
+
+        worker.jobs.put(
+            ModelJob(
+                record_id=rid,
+                text=None,
+                image=image,
+                version=version,
+                transform=item.transform,
+            )
+        )
+
+
+async def _vpr_collect(conn: Connection) -> None:
+    """Receive VPR ModelResults → SSE + optional embeddings/queue writes.
+
+    Free-form ids: descriptor stays in ServiceState only.
+    marker_views ids: UPSERT ``embeddings.embedding_megaloc`` and mark the
+    queue row done (with version_snapshot). Descriptor still kept in-memory
+    so ``GET /tasks/{id}`` works either way.
+    """
+    while True:
+        try:
+            result = await asyncio.to_thread(worker.results.get, timeout=0.5)
+        except Empty:
+            continue
+        rid = result.record_id
+        persist = _is_marker_view_id(rid)
+
+        if result.error:
+            state.set_task(rid, "error", result.error, kind="vpr")
+            if persist:
+                await _set_queue_status(conn, rid, "error", result.error)
+            state.bump(ok=False)
+            broadcaster.publish(
+                {
+                    "record_id": rid,
+                    "status": "error",
+                    "error": result.error,
+                    "kind": "vpr",
+                }
+            )
+            _note_finished(ok=False)
+            continue
+
+        emb = result.embedding or []
+
+        if persist:
+            try:
+                await _write_embedding(
+                    conn,
+                    rid,
+                    emb,
+                    field="embedding_megaloc",
+                    model=settings.megaloc_repo,
+                )
+            except Exception as e:
+                logger.warning("Failed to persist VPR %s: %s", rid, e)
+                state.set_task(rid, "error", str(e), kind="vpr")
+                await _set_queue_status(conn, rid, "error", str(e))
+                state.bump(ok=False)
+                broadcaster.publish(
+                    {
+                        "record_id": rid,
+                        "status": "error",
+                        "error": str(e),
+                        "kind": "vpr",
+                    }
+                )
+                _note_finished(ok=False)
+                continue
+            await _set_queue_status(conn, rid, "done", version=result.version)
+
+        state.set_task(rid, "done", kind="vpr", embedding=emb)
+        state.bump(ok=True)
+        broadcaster.publish(
+            {
+                "record_id": rid,
+                "status": "done",
+                "kind": "vpr",
+                "dim": len(emb),
+            }
+        )
+        logger.info(
+            "VPR done %s dim=%d persist=%s",
+            rid,
+            len(emb),
+            persist,
+        )
         _note_finished(ok=True)
 
 
@@ -793,10 +1081,22 @@ async def lifespan(app: FastAPI):
     await conn.connect()
 
     worker.start()
-    dispatch_task = asyncio.create_task(_dispatch(conn))
-    persist_task = asyncio.create_task(_persist(conn))
-    reconnect_task = asyncio.create_task(conn.reconnect_loop())
-    logger.info("Service ready (model loading in background)")
+    tasks = [
+        asyncio.create_task(conn.reconnect_loop()),
+    ]
+    # Only start the loops that match the active backend so results never
+    # cross-contaminate between _persist (DB) and _vpr_collect (memory).
+    if _is_jina():
+        tasks.append(asyncio.create_task(_dispatch(conn)))
+        tasks.append(asyncio.create_task(_persist(conn)))
+    if _is_megaloc():
+        tasks.append(asyncio.create_task(_vpr_dispatch(conn)))
+        tasks.append(asyncio.create_task(_vpr_collect(conn)))
+    logger.info(
+        "Service ready backend=%s device=%s (model loading in background)",
+        _backend(),
+        settings.device,
+    )
     yield
 
     # Wake SSE generators first so uvicorn reload is not blocked waiting for
@@ -804,33 +1104,78 @@ async def lifespan(app: FastAPI):
     broadcaster.close()
     await asyncio.sleep(0)  # let generators observe shutdown and exit
     worker.stop()
-    for t in (dispatch_task, persist_task, reconnect_task):
+    for t in tasks:
         t.cancel()
-    await asyncio.gather(dispatch_task, persist_task, reconnect_task, return_exceptions=True)
+    await asyncio.gather(*tasks, return_exceptions=True)
     await conn.close()
 
 
 app = FastAPI(title="Embedding Service", lifespan=lifespan)
 
 
-class GenerateRequest(BaseModel):
-    items: list[str]
-
-
 class QueryRequest(BaseModel):
+    """Jina query encode body (text and/or image)."""
+
     text: str | None = None
     image_url: str | None = None
     normalize: bool = False
 
 
-class SearchRequest(BaseModel):
-    """Cosine search over a registered target (default: markers via marker_views).
+class VprEncodeRequest(BaseModel):
+    """Sync MegaLoc descriptor for one image."""
 
-    Provide ``text``, ``image_url``, or both. ``top_k`` is the number of
-    **views** kept after cosine ranking (then collapsed onto parents).
-    ``min_score`` drops weak **view** hits before aggregation (default 0.55).
+    image_url: str
+    # squash | letterbox | center_crop — omit to use settings.vpr_transform
+    transform: str | None = None
+
+
+class EncodeRequest(BaseModel):
+    """Root ``/encode`` body — fields used depend on ``MODEL_BACKEND``.
+
+    Jina: ``text`` and/or ``image_url``, optional ``normalize``.
+    MegaLoc: ``image_url`` required, optional ``transform``.
+    """
+
+    text: str | None = None
+    image_url: str | None = None
+    normalize: bool = False
+    transform: str | None = None
+
+
+class GenerateItem(BaseModel):
+    """One async generate task (object form).
+
+    ``id`` is the SSE /tasks key. Free-form VPR ids need ``image_url`` and stay
+    in-memory only. ``marker_views:...`` ids UPSERT the matching embeddings
+    field and mirror ``embedding_queue``; ``image_url`` is optional then
+    (loaded from the record when omitted). Jina only accepts marker_views ids.
+    """
+
+    id: str
+    image_url: str | None = None
+
+
+class GenerateRequest(BaseModel):
+    """Queue embeds. Item form may be a bare record-id string or an object.
+
+    Root ``/generate`` dispatches by ``MODEL_BACKEND``. Backend-specific
+    aliases: ``/jina/generate``, ``/vpr/generate``.
+    """
+
+    items: list[str | GenerateItem]
+    transform: str | None = None  # MegaLoc only; ignored for Jina
+
+
+class SearchRequest(BaseModel):
+    """Cosine search over a registered target.
+
+    Query encoding follows the active ``MODEL_BACKEND`` (not the target):
+    Jina → text and/or image vs ``embedding_jina``; MegaLoc → image only vs
+    ``embedding_megaloc`` (any ``text`` is stripped with a warning). ``top_k`` is
+    the number of **views** kept after cosine ranking (then collapsed onto
+    parents). ``min_score`` drops weak **view** hits before aggregation.
     Parent score is ``max(sim) + α·log(1+n_views)`` (α = ``VIEW_COUNT_ALPHA``).
-    ``filters`` keys depend on the target (markers: ``level``).
+    ``filters`` keys depend on the target (markers*: ``level``).
     """
 
     target: str = "markers"
@@ -848,6 +1193,7 @@ async def _encode_inputs(
     normalize: bool,
 ) -> list[float]:
     """Shared path for /encode and /search: load image, run query encode."""
+    _require_jina()
     text = (text or "").strip() or None
     image = None
     if image_url:
@@ -883,9 +1229,9 @@ async def _encode_inputs(
             text,
             image,
             timeout,
-            normalize,
+            normalize=normalize,
         )
-    except (TimeoutError, ModelNotReadyError) as e:
+    except (TimeoutError, ModelNotReadyError, BackendMismatchError) as e:
         logger.warning(
             "Encode query failed after %.0fms (timeout=%s): %s",
             (time.perf_counter() - t0) * 1000,
@@ -913,30 +1259,217 @@ async def _encode_inputs(
     return embedding
 
 
-@app.post("/generate", status_code=202)
-async def generate(payload: GenerateRequest):
-    if not payload.items:
-        raise HTTPException(400, "items must not be empty")
+async def _encode_vpr(
+    *,
+    image_url: str,
+    transform: str | None,
+) -> list[float]:
+    """Load one image and run MegaLoc on the worker thread."""
+    _require_megaloc()
+    tfm = _parse_transform(transform)
+    conn: Connection = app.state.conn
+    image = await _load_vpr_image(conn, image_url)
+    if image is None:
+        raise HTTPException(400, "provide a valid image_url")
+
+    timeout = settings.query_timeout
+    timeout_label = "none" if timeout is None or timeout <= 0 else f"{timeout}s"
+    logger.info(
+        "VPR encode start image=%s transform=%s size=%d timeout=%s",
+        _image_ref_log(image_url),
+        tfm or settings.vpr_transform,
+        settings.vpr_image_size,
+        timeout_label,
+    )
+    t0 = time.perf_counter()
+    try:
+        embedding = await asyncio.to_thread(
+            worker.encode_vpr,
+            image,
+            timeout,
+            transform=tfm,
+        )
+    except (TimeoutError, ModelNotReadyError, BackendMismatchError) as e:
+        logger.warning(
+            "VPR encode failed after %.0fms: %s",
+            (time.perf_counter() - t0) * 1000,
+            e,
+        )
+        raise HTTPException(503, str(e))
+    except QueryError as e:
+        logger.warning(
+            "VPR encode error after %.0fms: %s",
+            (time.perf_counter() - t0) * 1000,
+            e,
+        )
+        raise HTTPException(502, str(e))
+
+    if not embedding:
+        raise HTTPException(502, "model returned an empty descriptor")
+    logger.info(
+        "VPR encode done dim=%d (%.0fms)",
+        len(embedding),
+        (time.perf_counter() - t0) * 1000,
+    )
+    return embedding
+
+
+def _normalize_generate_items(
+    items: list[str | GenerateItem],
+) -> list[tuple[str, str | None]]:
+    """Flatten bare strings / objects into ``(id, image_url | None)``."""
+    out: list[tuple[str, str | None]] = []
+    for raw in items:
+        if isinstance(raw, str):
+            tid = raw.strip()
+            url = None
+        else:
+            tid = (raw.id or "").strip()
+            url = (raw.image_url or "").strip() or None
+        if not tid:
+            raise HTTPException(422, "each item needs a non-empty id")
+        out.append((tid, url))
+    return out
+
+
+async def _queue_jina_generate(items: list[str | GenerateItem]) -> dict:
+    """Accept marker_views ids onto the Jina dispatch queue."""
+    _require_jina()
+    pairs = _normalize_generate_items(items)
     accepted: list[str] = []
-    for raw in payload.items:
-        rid_obj = _parse_record_id(raw.strip())
+    for tid, _url in pairs:
+        rid_obj = _parse_record_id(tid)
         rid = record_key(rid_obj)
-        state.set_task(rid, "queued")
+        state.set_task(rid, "queued", kind="jina")
         await job_queue.put(rid_obj)
-        broadcaster.publish({"record_id": rid, "status": "queued"})
+        broadcaster.publish(
+            {"record_id": rid, "status": "queued", "kind": "jina"}
+        )
         accepted.append(rid)
+    return {
+        "accepted": accepted,
+        "count": len(accepted),
+        "backend": "jina",
+    }
 
-    return {"accepted": accepted, "count": len(accepted)}
+
+async def _queue_vpr_generate(
+    items: list[str | GenerateItem],
+    transform: str | None,
+) -> dict:
+    """Accept VPR tasks. marker_views ids also write embeddings + queue."""
+    _require_megaloc()
+    pairs = _normalize_generate_items(items)
+    tfm = _parse_transform(transform)
+    accepted: list[str] = []
+    for tid, url in pairs:
+        if not url and not _is_marker_view_id(tid):
+            raise HTTPException(
+                422,
+                f"item {tid!r} needs image_url "
+                f"(or a marker_views:… id to load the record image)",
+            )
+        state.set_task(tid, "queued", kind="vpr", clear_embedding=True)
+        await vpr_queue.put(
+            VprQueueItem(task_id=tid, image_url=url, transform=tfm)
+        )
+        broadcaster.publish(
+            {"record_id": tid, "status": "queued", "kind": "vpr"}
+        )
+        accepted.append(tid)
+    return {
+        "accepted": accepted,
+        "count": len(accepted),
+        "backend": "megaloc",
+        "transform": tfm or settings.vpr_transform,
+        "image_size": settings.vpr_image_size,
+    }
 
 
-@app.post("/encode")
-async def encode(payload: QueryRequest):
+async def _jina_encode_response(payload: QueryRequest) -> dict:
     embedding = await _encode_inputs(
         text=payload.text,
         image_url=payload.image_url,
         normalize=payload.normalize,
     )
-    return {"embedding": embedding}
+    return {"embedding": embedding, "dim": len(embedding), "backend": "jina"}
+
+
+async def _vpr_encode_response(payload: VprEncodeRequest) -> dict:
+    if not (payload.image_url or "").strip():
+        raise HTTPException(400, "image_url is required")
+    embedding = await _encode_vpr(
+        image_url=payload.image_url.strip(),
+        transform=payload.transform,
+    )
+    return {
+        "embedding": embedding,
+        "dim": len(embedding),
+        "backend": "megaloc",
+        "transform": _parse_transform(payload.transform) or settings.vpr_transform,
+        "image_size": settings.vpr_image_size,
+    }
+
+
+@app.post("/generate", status_code=202)
+async def generate(payload: GenerateRequest):
+    """Queue embeds using the active ``MODEL_BACKEND``."""
+    if not payload.items:
+        raise HTTPException(400, "items must not be empty")
+    if _is_megaloc():
+        return await _queue_vpr_generate(payload.items, payload.transform)
+    return await _queue_jina_generate(payload.items)
+
+
+@app.post("/jina/generate", status_code=202)
+async def jina_generate(payload: GenerateRequest):
+    """Queue Jina embeds (requires ``MODEL_BACKEND=jina``)."""
+    if not payload.items:
+        raise HTTPException(400, "items must not be empty")
+    return await _queue_jina_generate(payload.items)
+
+
+@app.post("/vpr/generate", status_code=202)
+async def vpr_generate(payload: GenerateRequest):
+    """Queue VPR encodes (requires ``MODEL_BACKEND=megaloc``).
+
+    Free-form ids: descriptor via ``GET /tasks/{id}`` only.
+    ``marker_views:...`` ids: UPSERT ``embeddings.embedding_megaloc`` + queue.
+    """
+    if not payload.items:
+        raise HTTPException(400, "items must not be empty")
+    return await _queue_vpr_generate(payload.items, payload.transform)
+
+
+@app.post("/encode")
+async def encode(payload: EncodeRequest):
+    """Sync encode using the active ``MODEL_BACKEND``."""
+    if _is_megaloc():
+        return await _vpr_encode_response(
+            VprEncodeRequest(
+                image_url=payload.image_url or "",
+                transform=payload.transform,
+            )
+        )
+    return await _jina_encode_response(
+        QueryRequest(
+            text=payload.text,
+            image_url=payload.image_url,
+            normalize=payload.normalize,
+        )
+    )
+
+
+@app.post("/jina/encode")
+async def jina_encode(payload: QueryRequest):
+    """Sync Jina encode (requires ``MODEL_BACKEND=jina``)."""
+    return await _jina_encode_response(payload)
+
+
+@app.post("/vpr/encode")
+async def vpr_encode(payload: VprEncodeRequest):
+    """Sync MegaLoc descriptor (requires ``MODEL_BACKEND=megaloc``)."""
+    return await _vpr_encode_response(payload)
 
 
 @app.post("/search")
@@ -944,12 +1477,14 @@ async def search(payload: SearchRequest):
     q_text = (payload.text or "").strip() or None
     has_image = bool(payload.image_url and str(payload.image_url).strip())
     image_ref = _image_ref_log(payload.image_url) if has_image else "none"
+    backend = _backend()
 
     # Request summary first — text/filters/image flag only (never base64 body).
     logger.info(
-        "Search request target=%s text=%r filters=%s has_image=%s image=%s "
-        "top_k=%s min_score=%s",
+        "Search request target=%s backend=%s text=%r filters=%s has_image=%s "
+        "image=%s top_k=%s min_score=%s",
         payload.target,
+        backend,
         q_text,
         payload.filters or {},
         has_image,
@@ -964,13 +1499,40 @@ async def search(payload: SearchRequest):
         raise HTTPException(400, "top_k must be <= 100")
     if not -1.0 <= payload.min_score <= 1.0:
         raise HTTPException(400, "min_score must be between -1 and 1")
-    if not q_text and not has_image:
-        raise HTTPException(400, "provide text and/or image_url")
 
     try:
         target = get_target(payload.target)
     except KeyError as e:
         raise HTTPException(400, str(e)) from e
+
+    # Encode + cosine field follow MODEL_BACKEND (not target.query_backend).
+    # MegaLoc is image-only — drop text with a warning instead of rejecting.
+    if backend == "megaloc":
+        if q_text:
+            logger.warning(
+                "Search: stripping text=%r (megaloc is image-only)",
+                q_text,
+            )
+            q_text = None
+        if not has_image:
+            raise HTTPException(400, "image_url required for megaloc search")
+        emb_field = "embedding_megaloc"
+    else:
+        if not q_text and not has_image:
+            raise HTTPException(400, "provide text and/or image_url")
+        emb_field = "embedding_jina"
+
+    if target.embedding_field != emb_field:
+        logger.info(
+            "Search: target %s field %s → %s (backend=%s)",
+            target.name,
+            target.embedding_field,
+            emb_field,
+            backend,
+        )
+        target = replace(
+            target, embedding_field=emb_field, query_backend=backend
+        )
 
     try:
         filter_clauses, filter_params = bind_filters(target, payload.filters)
@@ -978,15 +1540,24 @@ async def search(payload: SearchRequest):
         raise HTTPException(400, str(e)) from e
 
     # Cosine search needs unit-length vectors; always normalize the query.
-    query_vec = await _encode_inputs(
-        text=payload.text,
-        image_url=payload.image_url,
-        normalize=True,
-    )
+    if backend == "megaloc":
+        query_vec = await _encode_vpr(
+            image_url=payload.image_url,
+            transform=None,
+        )
+    else:
+        query_vec = await _encode_inputs(
+            text=q_text,
+            image_url=payload.image_url,
+            normalize=True,
+        )
     logger.info(
-        "Search query encoded dim=%d target=%s text=%r has_image=%s",
+        "Search query encoded dim=%d target=%s backend=%s field=%s "
+        "text=%r has_image=%s",
         len(query_vec),
         target.name,
+        backend,
+        emb_field,
         q_text,
         has_image,
     )
@@ -1078,6 +1649,8 @@ async def search_targets():
     return {
         name: {
             "source_table": t.source_table,
+            "embedding_field": t.embedding_field,
+            "query_backend": t.query_backend,
             "parent_table": t.parent_table,
             "parent_field": t.parent_field,
             "filters": [f.key for f in t.filters],
@@ -1090,11 +1663,11 @@ async def search_targets():
 @app.get("/health")
 async def health():
     snap = state.snapshot()
-    return {
+    body: dict[str, Any] = {
         "worker_status": snap["model"],
         "model_error": snap["model_error"],
+        "backend": _backend(),
         "device": settings.device,
-        "modalities": settings.modalities,
         "uptime_seconds": snap["uptime_seconds"],
         "db_connected": snap["db_connected"],
         "db_error": snap["db_error"],
@@ -1103,8 +1676,19 @@ async def health():
             "total_errors": snap["errors"],
         },
         "pending": snap["pending"],
-        **_queue_info(),
+        "queue_capacity": settings.queue_capacity,
+        "queue_size": job_queue.qsize() + vpr_queue.qsize(),
+        "jina_queue_size": job_queue.qsize(),
+        "vpr_queue_size": vpr_queue.qsize(),
     }
+    if _is_jina():
+        body["modalities"] = settings.modalities
+        body["model"] = settings.model
+    if _is_megaloc():
+        body["megaloc_repo"] = settings.megaloc_repo
+        body["vpr_image_size"] = settings.vpr_image_size
+        body["vpr_transform"] = settings.vpr_transform
+    return body
 
 
 @app.get("/tasks")

@@ -4,7 +4,12 @@ from importlib import util
 
 logger = logging.getLogger(__name__)
 
-REQUIRED_LIBS = ["torch", "fastapi", "surrealdb", "pydantic", "sentence_transformers", "numpy"]
+# Core always required. Backend-specific libs are checked in check_deps()
+# against Settings.model_backend so Jina-only hosts need not install MegaLoc
+# extras and vice versa.
+REQUIRED_LIBS = ["torch", "fastapi", "surrealdb", "pydantic", "numpy"]
+JINA_LIBS = ["sentence_transformers"]
+MEGALOC_LIBS = ["torchvision", "huggingface_hub", "safetensors"]
 OPTIONAL_LIBS = ["win32api", "win32con", "win32process"]
 UTILITY_LIBS = ["colorlog"]
 
@@ -69,6 +74,29 @@ def check_deps():
             logger.error(f"  - {lib} не установлена\n")
         logger.info("\nУстановите их командой: pip install " + " ".join(missing_libs))
         sys.exit(1)
+
+    # Backend-specific imports — resolve settings lazily (needs .env).
+    backend = "megaloc"
+    try:
+        from src.config import get_settings
+
+        backend = (get_settings().model_backend or "megaloc").strip().lower()
+    except Exception as e:
+        logger.warning("Could not read model_backend for dep check: %s", e)
+
+    extra = MEGALOC_LIBS if backend in ("megaloc", "vpr") else JINA_LIBS
+    missing_backend = [lib for lib in extra if util.find_spec(lib) is None]
+    if missing_backend:
+        logger.critical(
+            "Отсутствуют зависимости для model_backend=%s!", backend
+        )
+        for lib in missing_backend:
+            logger.error(f"  - {lib} не установлена\n")
+        logger.info(
+            "\nУстановите их командой: pip install " + " ".join(missing_backend)
+        )
+        sys.exit(1)
+
     if missing_optional_libs:
         logger.warning("Отсутствуют необязательные зависимости!\n")
         logger.info("Установите их командой: pip install " + " ".join(missing_optional_libs))

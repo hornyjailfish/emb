@@ -19,8 +19,20 @@ def check_cuda():
 
 class Settings(BaseSettings):
     fastapi_port: int
+    # Active model backend on the single worker thread. Only one loads at a
+    # time — megaloc (VPR, torch.hub) or jina (text+image SentenceTransformer).
+    # Env: MODEL_BACKEND
+    model_backend: str = "megaloc"
+    # Jina (kept; used when model_backend=jina).
     model: str = "jinaai/jina-embeddings-v5-omni-nano-retrieval"
     modalities: str = "vision"
+    # MegaLoc hub entry (torch.hub.load). Env: MEGALOC_REPO / MEGALOC_ENTRY
+    megaloc_repo: str = "gmberton/MegaLoc"
+    megaloc_entry: str = "get_trained_model"
+    # VPR geometry. Default matches MegaLoc eval (322x322 squash).
+    # Env: VPR_IMAGE_SIZE / VPR_TRANSFORM
+    vpr_image_size: int = 322
+    vpr_transform: str = "squash"  # squash | letterbox | center_crop
     hf_home: str = "D:/models/"
     device: str = check_cuda()
     # Seconds to wait for a query encode. 0 / negative = no timeout (debug).
@@ -29,9 +41,10 @@ class Settings(BaseSettings):
     # Downscale images to at most this many pixels (aspect ratio kept) before
     # encoding. 262144 px (~512x512) yields the model's 256-vision-token floor
     # (its range is 256-1280 tokens), minimising CPU inference cost per image.
+    # Used by the Jina path only.
     image_max_pixels: int = 262144
     # Skip image downscaling entirely and pass raw bytes to the model (it
-    # accepts bytes directly). Env: DISABLE_IMAGE_TRANSFORM
+    # accepts bytes directly). Env: DISABLE_IMAGE_TRANSFORM. Jina path only.
     disable_image_transform: bool = False
     # Maximum records waiting in the dispatch queue (0 = unbounded).
     queue_capacity: int = 0

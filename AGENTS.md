@@ -1,33 +1,82 @@
-# Embeddings Service
+# Embeddings / VPR Service
 
-Internal service that generates text and image embeddings for SurrealDB
-`marker_views` records using `jinaai/jina-embeddings-v5-omni-nano-retrieval`.
+Internal service that runs **one** model backend on a single worker thread
+(resource constraint — never both at once). Selected by `MODEL_BACKEND`:
 
-The app calls an HTTP API; the service reads a record, fuses its text and image
-into ONE embedding (a `(text, image)` tuple → single forward pass), writes it
-back to the `embedding` field via `MERGE`, and downscales images into a PIL
-image before handing them to the model (see "Image handling" below).
+| Backend | Default | Model | Input | Output |
+|---|---|---|---|---|
+| `megaloc` | **yes** | [gmberton/MegaLoc](https://github.com/gmberton/MegaLoc) via `torch.hub` | image only | L2-normalized VPR descriptor (dim 8448) |
+| `jina` | no | `jinaai/jina-embeddings-v5-omni-nano-retrieval` (SentenceTransformer) | text and/or image | fused embedding |
+
+The default is MegaLoc (VPR). Jina code paths are kept and activated with
+`MODEL_BACKEND=jina`.
 
 Requires `surrealdb>=3.0.0b10` (native `File` / CBOR tag 55, builder-style
-`update().merge()`, `db.files.get`).
+`update().merge()` / `upsert().merge()`, `db.files.get`).
+
+Vectors are **not** stored on `marker_views`. Both backends UPSERT into the
+`embeddings` table (`embedding_jina` / `embedding_megaloc`) and mirror job
+status onto `embedding_queue`. Free-form VPR client ids (non-`marker_views`)
+still stay in-memory only.
+
+## Backends
+
+### MegaLoc / VPR (`MODEL_BACKEND=megaloc`)
+
+- Loaded with `torch.hub.load(megaloc_repo, megaloc_entry)` — raw torch /
+  torchvision, **not** sentence-transformers.
+- Reuses the same CUDA/CPU selection (`settings.device` / `check_cuda()`) and
+  Windows below-normal process priority on CPU.
+- Eval recipe: geometry → ToTensor → ImageNet normalize → forward.
+- Geometry size default **322×322** (`VPR_IMAGE_SIZE`); mode default **squash**
+  (`VPR_TRANSFORM`).
+- Async jobs via `POST /vpr/generate`:
+  - **`marker_views:…` ids** — load image from the row (or override
+    `image_url`), sample `version`, UPSERT `embeddings.embedding_megaloc` +
+    `data` + `model`, mirror `embedding_queue` (processing → done/failed +
+    `version_snapshot`). Descriptor also kept in `ServiceState` for
+    `GET /tasks/{id}`.
+  - **Free-form ids** — require `image_url`; status + descriptor in-memory /
+    SSE only (no queue / embeddings write).
+
+### Jina (`MODEL_BACKEND=jina`)
+
+- SentenceTransformer fused `(text, image)` → one vector.
+- Reads `marker_views` (`generated_description` + `image_url`), UPSERTs
+  `embeddings.embedding_jina` (+ `data` + `model`), mirrors status onto
+  `embedding_queue` (see Data model).
+- Image downscale via `prepare_image` / `IMAGE_MAX_PIXELS` /
+  `DISABLE_IMAGE_TRANSFORM`.
 
 ## Data model
 
-### `marker_views` (SCHEMAFULL)
+### `marker_views` (SCHEMAFULL) — source records (no vectors)
 
 | Field | Type | Notes |
 |---|---|---|
 | `marker` | `record<markers>` | REFERENCE |
 | `user_description` | `string \| none` | |
-| `generated_description` | computed `string` | `VALUE` joins level/zone/area/shop/aliases/user_description |
-| `embedding` | `array<float> \| none` | fused vector written by this service |
+| `generated_description` | computed `string` | joins level/zone/area/shop/aliases/user_description |
 | `image_url` | `file \| none` | SurrealDB v3 file pointer (bucket ref, CBOR tag 55) |
 | `version` | `int` | `VALUE ($value ?? 0) + 1` — bumps on every record write |
 
-Out-of-sync is **not** stored on this table. Compare
-`marker_views.version` with `embedding_queue.version_snapshot`.
+Out-of-sync is **not** stored here. Compare `marker_views.version` with
+`embedding_queue.version_snapshot`.
 
-### `embedding_queue` (SCHEMAFULL)
+### `embeddings` (SCHEMAFULL) — vectors (both backends)
+
+Row key matches the marker_views record key (`marker_views:abc` →
+`embeddings:abc`). Service UPSERTs via `db.upsert(rid).merge({...})` so one
+backend never wipes the other's field.
+
+| Field | Type | Notes |
+|---|---|---|
+| `embedding_megaloc` | `array<float> \| none` | VPR descriptor (MegaLoc) |
+| `embedding_jina` | `array<float> \| none` | fused Jina vector |
+| `model` | `string` | last writer label (default hub id / Jina model id) |
+| `data` | `record<marker_views>` | REFERENCE back to the view |
+
+### `embedding_queue` (SCHEMAFULL) — job status (both backends)
 
 Row key matches the marker_views record key (`marker_views:abc` →
 `embedding_queue:abc`), created by the app's `add_embedding_task` event.
@@ -50,145 +99,148 @@ marker_views.version != embedding_queue.version_snapshot
 
 Two OS threads; no live queries, no batching.
 
-- **Model worker thread** (`src/worker.py`) — loads the model lazily in the
-  background, then processes jobs one at a time. `encode_document` for record
-  embeddings, `encode_query` for on-the-fly search queries. Each job is ONE
-  model call: `worker._fused_input` turns text and/or image into a
-  `(text, image)` tuple (or the lone modality) and the model returns a single
-  fused vector. `ModelJob.version` carries the dispatch-time snapshot through
-  to `ModelResult`.
+- **Model worker thread** (`src/worker.py`) — loads **one** backend lazily in
+  the background (`_load_megaloc` or `_load_jina`), then processes jobs one at
+  a time. Query jobs (sync encode endpoints) are preferred over queued jobs.
 - **Main async loop** (`src/main.py`) — FastAPI + SurrealDB (async SDK) + SSE.
+  Lifespan starts only the loops that match the active backend:
+  - megaloc: `_vpr_dispatch` + `_vpr_collect` (SSE + embeddings/queue when
+    marker_views-backed)
+  - jina: `_dispatch` + `_persist` (embeddings + queue + SSE)
 
-Bridge between them: two thread-safe `queue.Queue`s.
-- `_dispatch` (loop): read record → sample `version` → push `ModelJob`.
-- `_persist` (loop): receive `ModelResult` → `MERGE embedding` onto
-  `marker_views` → on success, set `embedding_queue` to `done` +
-  `version_snapshot`.
-
-Both loops also mirror task status onto the matching `embedding_queue` row:
-`processing` when dispatched, then `done` / `failed` (+ `error_message`) at
-the terminal states.
-
-Queries bypass the DB: `POST /encode` pushes a `QueryJob` and blocks on a
-`threading.Condition` until the worker returns the embedding.
+Bridge: thread-safe `queue.Queue`s (`worker.jobs` / `worker.results` /
+`worker._query_jobs`).
 
 ### SSE (`GET /queue/stream`)
 
-Lifecycle events: `queued` → `processing` → `done` | `error`.
+Shared by both backends. Lifecycle: `queued` → `processing` → `done` | `error`
+(plus `queue_done` when a busy wave drains). Events may include `"kind": "vpr"`
+or `"kind": "jina"`. VPR `done` events carry `dim` (not the full vector).
 
 On app shutdown / uvicorn reload, `broadcaster.close()` pushes a shutdown
 sentinel to every subscriber. Generators also poll `broadcaster.closed` and
 `request.is_disconnected()` on a 1s timeout with SSE comment heartbeats, so
 reload is not blocked waiting for the client to drop the stream.
 
-## Image handling (CPU)
+## Image handling
 
-The model runs on CPU, so image size is the main cost driver.
+### Shared loading (`main._image_bytes`)
 
-- The model (`jinaai/jina-embeddings-v5-omni-nano-retrieval`) accepts a
-  `PIL.Image` directly (also bytes, paths, URLs, ndarray) — no temp files or
-  URL round-trip needed.
-- Its vision processor turns each image into 256–1280 vision tokens
-  (262144–1310720 px), so CPU cost scales with pixel count.
-- `worker.prepare_image(data, max_pixels)` downscales (aspect ratio kept, never
-  upscales) before encoding. `main._prepare_image` loads the bytes (bucket
-  pointer via `_read_file_bytes` → `db.files.get(File)`, or `http(s)` via
-  httpx) then calls it, and the resulting PIL image becomes the image part of
-  the fused model input. A malformed or missing image degrades to text-only —
-  it is dropped here, never sent to the model.
-- The size cap is `settings.image_max_pixels` (env `IMAGE_MAX_PIXELS`). Its
-  default `262144` px (~512×512) is the model's floor — the fastest CPU
-  setting. Raise it for more detail (e.g. `1310720` = 1280 tokens) once you have
-  a GPU. This is the single source of truth for the size — don't hardcode it.
-- `settings.disable_image_transform` (env `DISABLE_IMAGE_TRANSFORM`) skips the
-  downscale entirely and passes the raw bytes straight to the model (it accepts
-  bytes directly). `_prepare_image` returns the bytes as-is; the model input
-  types (`ModelJob.image` / `QueryJob.image` / `_fused_input`) accept `bytes`.
-- One job runs at a time, so the prepared image is simply used and dropped (no
-  cleanup juggling).
+Resolves `data:` / bare base64, `http(s)`, or Surreal `File` / `bucket:/key`
+the same way for every endpoint. Never logs payload bodies.
+
+### VPR geometry (`src/preprocess.py`)
+
+Reusable modes — all produce an exact `size×size` RGB image (default size 322):
+
+| Mode | Env / field value | Behavior |
+|---|---|---|
+| **squash** | `squash` (default) | Stretch to square; ignore aspect (MegaLoc eval default) |
+| **letterbox** | `letterbox` | Fit inside square, pad short axis (ImageNet-mean pad) |
+| **center_crop** | `center_crop` | Scale so short side covers size, center-crop to square |
+
+Worker then applies ImageNet normalize and runs MegaLoc. Per-request override
+via `transform` on `/vpr/encode` and `/vpr/generate`. Settings:
+`VPR_IMAGE_SIZE`, `VPR_TRANSFORM`.
+
+### Jina downscale (`worker.prepare_image`)
+
+- Aspect-preserving max-pixel cap (`IMAGE_MAX_PIXELS`, default `262144`).
+- `DISABLE_IMAGE_TRANSFORM=true` passes raw bytes to the model (Jina accepts
+  bytes). Not used on the VPR path — MegaLoc always needs geometry + norm.
 
 ## Files
 
 - `src/config.py` — pydantic-settings (`Settings`, `get_settings`).
-- `src/state.py` — `ServiceState`, small thread-safe status registry.
-- `src/worker.py` — model worker thread, `prepare_image`, `ModelJob` / `ModelResult`.
-- `src/search.py` — search target registry, cosine candidate query, parent aggregation.
-- `src/main.py` — app, endpoints, dispatch/persist tasks, SSE, image loading.
-- `src/utils.py` — logging, dependency check, Windows process priority.
+- `src/preprocess.py` — `squash` / `letterbox` / `center_crop`, `transform_image`.
+- `src/state.py` — `ServiceState`; VPR tasks may hold `embedding` in memory.
+- `src/worker.py` — model worker, MegaLoc + Jina loaders, `prepare_image`,
+  `image_to_megaloc_tensor`, `ModelJob` / `ModelResult` / `QueryJob`.
+- `src/search.py` — cosine search target registry / aggregation (Jina + VPR).
+- `src/main.py` — app, endpoints, dispatch/persist/VPR loops, SSE, image loading.
+- `src/utils.py` — logging, backend-aware dependency check, Windows priority.
 - `run.py` — uvicorn entrypoint (`reload=True`).
-- `requirements.txt` — pins `surrealdb>=3.0.0b10`.
+- `requirements.txt` — torch/torchvision + HF hub/safetensors (MegaLoc);
+  sentence-transformers (Jina); `surrealdb>=3.0.0b10`.
+
+## Settings (env)
+
+| Key | Default | Notes |
+|---|---|---|
+| `MODEL_BACKEND` | `megaloc` | `megaloc` \| `jina` |
+| `MEGALOC_REPO` | `gmberton/MegaLoc` | `torch.hub` repo |
+| `MEGALOC_ENTRY` | `get_trained_model` | hub entrypoint |
+| `VPR_IMAGE_SIZE` | `322` | square side in px |
+| `VPR_TRANSFORM` | `squash` | `squash` \| `letterbox` \| `center_crop` |
+| `MODEL` | jina id | Jina only |
+| `MODALITIES` | `vision` | Jina only |
+| `IMAGE_MAX_PIXELS` | `262144` | Jina only |
+| `DISABLE_IMAGE_TRANSFORM` | `false` | Jina only |
+| `DEVICE` | auto cuda/cpu | both |
+| `HF_HOME` | `D:/models/` | both |
+| `QUERY_TIMEOUT` | `0` | 0 = no timeout |
 
 ## Search
 
-`POST /search` encodes a query (text and/or image — either alone is fine),
-runs cosine similarity over a registered **target**, keeps the top-k **views**
-above a view-level score cutoff, collapses those onto a parent entity, and
-returns the resulting parents (ranked by best view).
+`POST /search` encodes a query with the **active** `MODEL_BACKEND`, runs cosine
+over a registered **target**, keeps top-k **views** above `min_score`, collapses
+onto a parent. Source table is always `embeddings`; view ids in the response are
+the linked `marker_views` records (`SELECT data AS id`).
 
-### Markers target (default)
+Encoding / vector field follow the live backend (not a hard target lock-in):
 
-- Source vectors: `marker_views.embedding`
-- Parent: `marker_views.marker` → `markers`
+| `MODEL_BACKEND` | Vector field | Query input |
+|---|---|---|
+| `jina` | `embedding_jina` | text and/or image |
+| `megaloc` | `embedding_megaloc` | image only — any `text` is stripped with a **warning** |
+
+Registered target names (`markers`, `markers_vpr`) still select filters/parent
+shape; if their default field disagrees with the live backend, search swaps the
+field to match.
+
+- Parent: `data.marker` → `markers`
 - `top_k`: max **views** kept (not parents)
-- `min_score`: view cosine cutoff (default `0.55`); weak views never reach
-  parent aggregation — pass `0` / `-1` to loosen
-- Parent score: `max(sim) + α · log(1 + n_views)` where `n_views` is how many
-  of that marker’s views cleared the gate; `α` is `VIEW_COUNT_ALPHA` in
-  `src/search.py` (default `0.07`). Peak dominates; multi-hit is a small boost
-  (response also includes raw `peak`)
-- Filter: `filters.level` → `marker.level` (record id)
-- Response hydrates parent `level`, `zone`, `closest_shop`, `geometry`
-
-```json
-POST /search
-{
-  "target": "markers",
-  "text": "near the fountain",
-  "image_url": null,
-  "top_k": 10,
-  "min_score": 0.55,
-  "filters": { "level": "levels:ground" }
-}
-```
-
-```json
-{
-  "target": "markers",
-  "top_k": 10,
-  "min_score": 0.55,
-  "count": 1,
-  "results": [
-    {
-      "id": "markers:abc",
-      "peak": 0.91,
-      "score": 0.987,
-      "views": [
-        { "id": "marker_views:1", "score": 0.91 },
-        { "id": "marker_views:2", "score": 0.60 }
-      ],
-      "level": "levels:ground",
-      "geometry": { "...": "geojson point" }
-    }
-  ]
-}
-```
+- `min_score`: view cosine cutoff; weak views never reach parent aggregation
+- Parent score: `max(sim) + α · log(1 + n_views)` (`VIEW_COUNT_ALPHA` in
+  `src/search.py`, default `0.07`)
+- Filter: `filters.level` → `data.marker.level`
 
 ### Extending to more tables
 
-Register another `SearchTarget` in `src/search.py` → `TARGETS`. No endpoint
-change. Each target declares source table, embedding field, optional parent
-collapse, filters (`FilterDef`), and parent columns to hydrate.
+Register another `SearchTarget` in `src/search.py` → `TARGETS`.
 `GET /search/targets` lists what is registered.
 
 ## Endpoints
 
-- `POST /generate` `{"items": ["marker_views:..."]}` → `202`
-- `POST /encode` `{"text": "..."}` and/or `{"image_url": "..."}` → `{"embedding": [...]}`
-- `POST /search` — cosine search (see Search); text and/or image, `top_k` views, `min_score`, filters
-- `GET /search/targets` — registered targets + filter keys
-- `GET /health`
-- `GET /tasks`, `GET /tasks/{record_id}`
-- `GET /queue/stream` — SSE task feed (`queued` / `processing` / `done` / `error` / `queue_done`)
+### Root (dispatches by `MODEL_BACKEND`)
+
+- `POST /encode` — sync one-shot vector
+  - jina: `{"text"?, "image_url"?, "normalize"?}` → `{embedding, dim, backend}`
+  - megaloc: `{"image_url", "transform"?}` → `{embedding, dim, backend, ...}`
+- `POST /generate` — async batch → `202` `{accepted, count, backend, ...}`
+  - jina: `{"items": ["marker_views:…"]}` → UPSERT `embedding_jina` + queue
+  - megaloc: `{"items": ["marker_views:…"] | {"id", "image_url"?}], "transform"?}`
+    → UPSERT `embedding_megaloc` + queue for marker_views ids; free-form ids
+    stay in-memory only
+
+### Backend-specific aliases (503 if wrong `MODEL_BACKEND`)
+
+- `POST /jina/encode`, `POST /jina/generate` — Jina only
+- `POST /vpr/encode`, `POST /vpr/generate` — MegaLoc only
+
+`image_url` accepts `data:` / base64, `http(s)`, or `bucket:/key` (needs DB).
+
+### Search (encoder follows live `MODEL_BACKEND`)
+
+- `POST /search` — cosine search (see Search); text stripped+warned on megaloc
+- `GET /search/targets` — registered targets + filter keys + `query_backend`
+
+### Shared
+
+- `GET /health` — includes `backend`, device, queue sizes, VPR or Jina fields
+- `GET /tasks`, `GET /tasks/{id}` — in-memory status; VPR `done` includes
+  `embedding`. `GET /tasks` lists omit full vectors (`has_embedding` + `dim`)
+- `GET /queue/stream` — SSE task feed
 - `GET /files/{bucket}/{path}` — bucket file proxy
 
 ## Conventions
@@ -206,11 +258,14 @@ collapse, filters (`FilterDef`), and parent columns to hydrate.
   `await db.files.get(File(bucket, key))` — never interpolate into SurrealQL.
   `image_url` on a record arrives as a `File`; string forms `bucket:/key` are
   still accepted for the proxy/encode endpoints via `_as_file`.
-- **Writes**: `await db.update(rid).merge({...})` (SDK 3.x has no top-level
-  `merge`). Only write `embedding` onto `marker_views` — do not invent fields
-  (SCHEMAFULL). Version snapshot goes to `embedding_queue.version_snapshot`.
-  Leave `generated_description` (computed) alone.
+- **Writes (vectors)**: `await db.upsert(embeddings_rid).merge({field,
+  model, data})` where `field` is `embedding_jina` or `embedding_megaloc`.
+  Never write vectors onto `marker_views`. Leave `generated_description`
+  alone. Version snapshot goes to `embedding_queue.version_snapshot` only
+  (on successful embed). Queue status via `await db.update(queue_rid).merge(...)`.
+- **Writes (VPR free-form ids)**: none — descriptors stay in `ServiceState`.
 - **DB**: use the async SDK; it self-connects on first RPC. Connection is
   wrapped in `main.Connection`, which retries on startup and pings liveness so
   an unavailable DB never crashes the app.
 - DB access stays on the async loop; model inference stays on the worker thread.
+- **One backend at a time** — do not attempt to load Jina and MegaLoc together.

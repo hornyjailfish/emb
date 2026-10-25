@@ -32,7 +32,7 @@ from src.ids import parse_record_id, record_key
 # Multi-hit boost on parent score: max(sim) + α * log(1 + n_views).
 # Keep small so raw cosine still dominates; bump if multi-view support
 # should matter more.
-VIEW_COUNT_ALPHA: float = 0.07
+VIEW_COUNT_ALPHA: float = 0.04
 
 
 @dataclass(frozen=True)
@@ -55,8 +55,14 @@ class SearchTarget:
     name: str
     source_table: str
     embedding_field: str = "embedding"
+    # SurrealQL expression projected AS id (default: row id).
+    # Use e.g. ``data`` when vectors live on ``embeddings`` and the view id
+    # should be the linked ``marker_views`` record.
+    id_expr: str = "id"
     # Collapse source rows onto this link field (None = no grouping).
+    # ``parent_expr`` is the SurrealQL path; result column is ``parent_field``.
     parent_field: str | None = None
+    parent_expr: str | None = None
     parent_table: str | None = None
     # Columns to SELECT from parent_table when hydrating hits.
     parent_fields: tuple[str, ...] = ()
@@ -64,25 +70,44 @@ class SearchTarget:
     # Extra headroom when fetching views (usually 1 — top_k is view-level).
     candidate_multiplier: int = 1
     min_candidate_limit: int = 1
+    # Which model backend encodes the query for this target.
+    # ``jina`` → text and/or image; ``megaloc`` → image-only VPR.
+    query_backend: str = "jina"
 
 
 # ---------------------------------------------------------------------------
 # Registry — add targets here to expose them on POST /search
 # ---------------------------------------------------------------------------
 
+# Vectors live on ``embeddings`` (not marker_views). Each row links back via
+# ``data → marker_views``; parent marker is ``data.marker``. View ids in the
+# response are the marker_views records (``data AS id``).
+_MARKERS_COMMON = dict(
+    source_table="embeddings",
+    id_expr="data",
+    parent_field="marker",
+    parent_expr="data.marker",
+    parent_table="markers",
+    parent_fields=("level", "zone", "closest_shop", "geometry"),
+    filters=(
+        FilterDef(key="level", expr="data.marker.level", kind="record"),
+        # zone reserved for later — enable when the app needs it:
+        # FilterDef(key="zone", expr="data.marker.zone", kind="record"),
+    ),
+)
+
 TARGETS: dict[str, SearchTarget] = {
     "markers": SearchTarget(
         name="markers",
-        source_table="marker_views",
-        embedding_field="embedding",
-        parent_field="marker",
-        parent_table="markers",
-        parent_fields=("level", "zone", "closest_shop", "geometry"),
-        filters=(
-            FilterDef(key="level", expr="marker.level", kind="record"),
-            # zone reserved for later — enable when the app needs it:
-            # FilterDef(key="zone", expr="marker.zone", kind="record"),
-        ),
+        embedding_field="embedding_jina",
+        query_backend="jina",
+        **_MARKERS_COMMON,
+    ),
+    "markers_vpr": SearchTarget(
+        name="markers_vpr",
+        embedding_field="embedding_megaloc",
+        query_backend="megaloc",
+        **_MARKERS_COMMON,
     ),
 }
 
@@ -310,9 +335,16 @@ def build_candidate_query(
     if min_score is not None:
         where.append(f"{score_expr} >= $min_score")
     where_sql = " AND ".join(where)
-    parent_sel = f", {target.parent_field}" if target.parent_field else ""
+    id_sel = f"{target.id_expr} AS id" if target.id_expr != "id" else "id"
+    parent_sel = ""
+    if target.parent_field:
+        p_expr = target.parent_expr or target.parent_field
+        if p_expr == target.parent_field:
+            parent_sel = f", {target.parent_field}"
+        else:
+            parent_sel = f", {p_expr} AS {target.parent_field}"
     return (
-        f"SELECT id{parent_sel}, "
+        f"SELECT {id_sel}{parent_sel}, "
         f"{score_expr} AS score "
         f"FROM {target.source_table} "
         f"WHERE {where_sql} "
