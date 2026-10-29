@@ -9,13 +9,17 @@ Add a new searchable collection by registering a ``SearchTarget`` in
 - which request ``filters`` map onto SurrealQL predicates;
 - which parent columns to hydrate in the response (``parent_fields``).
 
-Ranking: take the top-k **views** above ``min_score``, then collapse onto
-parents. Parent score is peak cosine plus a small multi-hit boost::
+Ranking: take the top-k **views** (optional soft-deprecated ``min_score``
+noise floor), then collapse onto parents. Parent score is peak cosine plus
+a small multi-hit boost::
 
     score = max(sim) + α · log(1 + n_views)
 
 so one strong match stays on top, while genuine multi-view support still
 nudges a marker up. Tune α via ``VIEW_COUNT_ALPHA`` (default 0.04).
+
+``min_score`` is soft-deprecated: prefer client-side score thresholds; keep
+the param only as an optional server noise floor (default off / ``0``).
 """
 
 from __future__ import annotations
@@ -172,6 +176,10 @@ def filter_top_views(
 ) -> list[dict[str, Any]]:
     """Keep scored rows at/above ``min_score``, capped at ``top_k``.
 
+    ``min_score`` is a soft-deprecated optional noise floor (pass ``0`` / ``-1``
+    to skip). Prefer filtering scores on the client; ``top_k`` is the main
+    retrieval cap.
+
     Assumes ``rows`` are already ordered by score descending (as produced by
     ``build_candidate_query``). Once a row falls below the cutoff, the rest
     are skipped.
@@ -324,6 +332,9 @@ def build_candidate_query(
 
     When ``min_score`` is set, the cosine expression is also applied in WHERE
     against ``$min_score`` so LIMIT counts only qualifying views.
+
+    ``min_score`` is soft-deprecated (optional noise floor). Omit / pass
+    ``None`` when the client thresholds scores itself.
     """
     score_expr = f"vector::similarity::cosine({target.embedding_field}, $query)"
     where = [f"{target.embedding_field} IS NOT NONE", *filter_clauses]

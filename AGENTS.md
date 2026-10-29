@@ -182,9 +182,9 @@ via `transform` on `/encode` and `/generate`. Settings:
 ## Search
 
 `POST /search` encodes a query image with MegaLoc, runs cosine over a
-registered **target**, keeps top-k **views** above `min_score`, collapses
-onto a parent. Source table is always `embeddings`; view ids in the response
-are the linked `marker_views` records (`SELECT data AS id`).
+registered **target**, keeps top-k **views**, collapses onto a parent. Source
+table is always `embeddings`; view ids in the response are the linked
+`marker_views` records (`SELECT data AS id`).
 
 | Vector field | Query input |
 |---|---|
@@ -194,8 +194,11 @@ Registered targets: `markers`, `markers_vpr` (alias — same field/shape).
 
 - Parent: `data.marker` → `markers`
 - Parent hydrate fields: `level`, `zone`, `geometry`, `label`
-- `top_k`: max **views** kept (not parents)
-- `min_score`: view cosine cutoff
+- `top_k`: max **views** kept (not parents) — main retrieval cap
+- `min_score`: **soft-deprecated** optional view cosine **noise floor**
+  (default `0` = off for typical scores). Not a relevance/confidence gate;
+  prefer client-side score filtering. Response may include `warnings` when
+  `min_score > 0`. OpenAPI marks the field `deprecated`.
 - Parent score: `max(sim) + α · log(1 + n_views)` (`VIEW_COUNT_ALPHA`, default `0.04`)
 - Filter: `filters.level` → `data.marker.level` (`record<basemap_floor>`)
 

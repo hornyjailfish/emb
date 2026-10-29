@@ -15,7 +15,7 @@ from urllib.parse import unquote_to_bytes
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from surrealdb import AsyncSurreal, AsyncSurrealConnection, File, RecordID
 from surrealdb.errors import (
     ConnectionUnavailableError,
@@ -1068,15 +1068,30 @@ class SearchRequest(BaseModel):
 
     Image-only query vs ``embeddings.embedding``. ``top_k`` is the number of
     **views** kept after cosine ranking (then collapsed onto parents).
-    ``min_score`` drops weak **view** hits before aggregation. Parent score is
-    ``max(sim) + α·log(1+n_views)`` (α = ``VIEW_COUNT_ALPHA``).
+    Parent score is ``max(sim) + α·log(1+n_views)`` (α = ``VIEW_COUNT_ALPHA``).
     ``filters`` keys depend on the target (markers*: ``level``).
+
+    ``min_score`` is **soft-deprecated**: optional server-side view noise floor
+    only (default ``0`` = off for typical scores). Prefer wide ``top_k`` +
+    level filters here and threshold scores on the client. Do not treat it as
+    relevance/confidence.
     """
 
     target: str = "markers"
     image_url: str | None = None
     top_k: int = 10
-    min_score: float = 0.45
+    # Soft-deprecated via description + OpenAPI `deprecated` (not
+    # Field(deprecated=True) — that emits DeprecationWarning on every request).
+    min_score: float = Field(
+        default=0.0,
+        description=(
+            "SOFT-DEPRECATED optional view cosine noise floor before top_k. "
+            "Default 0 (off for typical VPR scores). Prefer top_k + client-side "
+            "score filtering; not a relevance/confidence gate. Retained for a "
+            "possible server noise floor when the gallery is large."
+        ),
+        json_schema_extra={"deprecated": True},
+    )
     filters: dict[str, Any] | None = None
 
 
@@ -1252,6 +1267,12 @@ async def search(payload: SearchRequest):
         raise HTTPException(400, "top_k must be <= 100")
     if not -1.0 <= payload.min_score <= 1.0:
         raise HTTPException(400, "min_score must be between -1 and 1")
+    if payload.min_score > 0.0:
+        logger.info(
+            "Search min_score=%.4f is soft-deprecated; prefer client-side score "
+            "filtering (noise floor only)",
+            payload.min_score,
+        )
     if not has_image:
         raise HTTPException(400, "image_url required for VPR search")
 
@@ -1341,13 +1362,20 @@ async def search(payload: SearchRequest):
         top,
     )
 
-    return {
+    body: dict[str, Any] = {
         "target": target.name,
         "top_k": payload.top_k,
         "min_score": payload.min_score,
         "count": len(hits),
         "results": hits,
     }
+    # Soft-deprecation signal for clients still tuning server-side cutoffs.
+    if payload.min_score > 0.0:
+        body["warnings"] = [
+            "min_score is soft-deprecated: optional noise floor only; "
+            "prefer top_k + client-side score filtering"
+        ]
+    return body
 
 
 @app.get("/search/targets")
