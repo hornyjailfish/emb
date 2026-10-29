@@ -15,7 +15,7 @@ parents. Parent score is peak cosine plus a small multi-hit boost::
     score = max(sim) + α · log(1 + n_views)
 
 so one strong match stays on top, while genuine multi-view support still
-nudges a marker up. Tune α via ``VIEW_COUNT_ALPHA`` (default 0.07).
+nudges a marker up. Tune α via ``VIEW_COUNT_ALPHA`` (default 0.04).
 """
 
 from __future__ import annotations
@@ -70,9 +70,6 @@ class SearchTarget:
     # Extra headroom when fetching views (usually 1 — top_k is view-level).
     candidate_multiplier: int = 1
     min_candidate_limit: int = 1
-    # Which model backend encodes the query for this target.
-    # ``jina`` → text and/or image; ``megaloc`` → image-only VPR.
-    query_backend: str = "jina"
 
 
 # ---------------------------------------------------------------------------
@@ -84,11 +81,12 @@ class SearchTarget:
 # response are the marker_views records (``data AS id``).
 _MARKERS_COMMON = dict(
     source_table="embeddings",
+    embedding_field="embedding",
     id_expr="data",
     parent_field="marker",
     parent_expr="data.marker",
     parent_table="markers",
-    parent_fields=("level", "zone", "closest_shop", "geometry"),
+    parent_fields=("level", "zone", "geometry", "label"),
     filters=(
         FilterDef(key="level", expr="data.marker.level", kind="record"),
         # zone reserved for later — enable when the app needs it:
@@ -99,14 +97,11 @@ _MARKERS_COMMON = dict(
 TARGETS: dict[str, SearchTarget] = {
     "markers": SearchTarget(
         name="markers",
-        embedding_field="embedding_jina",
-        query_backend="jina",
         **_MARKERS_COMMON,
     ),
+    # Alias kept so existing clients of markers_vpr keep working.
     "markers_vpr": SearchTarget(
         name="markers_vpr",
-        embedding_field="embedding_megaloc",
-        query_backend="megaloc",
         **_MARKERS_COMMON,
     ),
 }
@@ -267,10 +262,10 @@ def aggregate_by_parent(
 def _parse_filter_record_id(value: Any) -> RecordID:
     """Parse a filter value into a ``RecordID``, coercing numeric ids to ``int``.
 
-    Surreal stores ``levels:-1`` with an integer id ``-1``. String parse keeps
-    the segment as ``"-1"``, and ``levels:-1`` (str) never equals ``levels:-1``
-    (int) — filters then match nothing. Coerce plain integer segments (optional
-    leading ``-``) so equality works. Also strips SurrealQL ``⟨⟩`` escapes.
+    Surreal stores ``basemap_floor:-1`` with an integer id ``-1``. String parse
+    keeps the segment as ``"-1"``, and equality then fails. Coerce plain integer
+    segments (optional leading ``-``) so equality works. Also strips SurrealQL
+    ``⟨⟩`` escapes.
     """
     rid = parse_record_id(value if isinstance(value, RecordID) else str(value).strip())
 
@@ -394,6 +389,9 @@ async def hydrate_parents(
             for col in target.parent_fields:
                 if col in parent:
                     val = parent[col]
-                    merged[col] = _as_id_str(val) if col in ("level", "zone", "closest_shop") else val
+                    # Record links stay as bare table:id strings.
+                    merged[col] = (
+                        _as_id_str(val) if col in ("level", "zone") else val
+                    )
         out.append(merged)
     return out

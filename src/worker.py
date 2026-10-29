@@ -1,16 +1,10 @@
-"""Single-thread model worker.
+"""Single-thread MegaLoc (VPR) model worker.
 
-Loads ONE backend at a time (resource constraint) — either MegaLoc (VPR,
-raw torch) or Jina (SentenceTransformer). Jobs and queries share that thread.
+One backend only — raw torch via torch.hub. Jobs and queries share the thread.
 
-MegaLoc path:
   - image-only descriptors, L2-normalized, dim 8448
   - geometry via ``src.preprocess`` (squash / letterbox / center_crop)
   - ImageNet normalize + torch tensor on the configured device
-
-Jina path (kept, activated with MODEL_BACKEND=jina):
-  - fused text+image via encode_document / encode_query
-  - prepare_image downscale (max_pixels)
 """
 
 from __future__ import annotations
@@ -20,7 +14,6 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from io import BytesIO
 from typing import Any
 
 import torch
@@ -43,16 +36,13 @@ _IMAGENET_STD = (0.229, 0.224, 0.225)
 
 @dataclass
 class ModelJob:
-    """Queued record embed (Jina or VPR — image-only when backend is megaloc)."""
+    """Queued VPR embed (image-only)."""
 
     record_id: str
-    text: str | None
-    # Prepared PIL image, raw bytes, or a source the Jina model loads.
-    image: Image.Image | bytes | str | None
-    # Record `version` sampled at dispatch time; written back as
-    # embedding_queue.version_snapshot on successful persist (both backends
-    # when the job is marker_views-backed).
-    version: Any = None
+    image: Image.Image | bytes
+    # marker_views.image_hash sampled at dispatch; written back as
+    # embedding_queue.hash_snapshot on successful persist (marker_views jobs).
+    image_hash: str | None = None
     # Optional per-job VPR geometry override (else settings.vpr_transform).
     transform: str | None = None
 
@@ -62,16 +52,14 @@ class ModelResult:
     record_id: str
     embedding: list[float] | None
     error: str | None = None
-    version: Any = None
+    image_hash: str | None = None
 
 
 @dataclass
 class QueryJob:
-    """Synchronous on-demand encode (encode_query / encode_vpr)."""
+    """Synchronous on-demand encode (encode_vpr)."""
 
-    text: str | None
-    image: Image.Image | bytes | str | None
-    normalize: bool = False
+    image: Image.Image | bytes
     # VPR geometry override for this call.
     transform: str | None = None
     # Filled under Condition once the worker finishes this job.
@@ -88,47 +76,9 @@ class QueryError(RuntimeError):
     pass
 
 
-class BackendMismatchError(RuntimeError):
-    """Raised when a caller asks for a backend that is not the loaded one."""
-
-
 # ---------------------------------------------------------------------------
-# Image helpers (Jina)
+# Helpers
 # ---------------------------------------------------------------------------
-
-
-def prepare_image(data: bytes, max_pixels: int) -> Image.Image:
-    """Decode bytes → RGB PIL and downscale if ``w*h > max_pixels``.
-
-    Aspect ratio kept; never upscales. Used by the Jina path.
-    """
-    if max_pixels < 1:
-        raise ValueError(f"max_pixels must be >= 1, got {max_pixels}")
-    with Image.open(BytesIO(data)) as im:
-        img = im.convert("RGB")
-    w, h = img.size
-    pixels = w * h
-    if pixels <= max_pixels:
-        return img
-    scale = (max_pixels / pixels) ** 0.5
-    nw = max(1, int(w * scale))
-    nh = max(1, int(h * scale))
-    return img.resize((nw, nh), Image.Resampling.BICUBIC)
-
-
-def _fused_input(
-    text: str | None, image: Image.Image | bytes | str | None
-) -> str | Image.Image | bytes | tuple | None:
-    """Build the single input SentenceTransformer encode_* expects."""
-    has_t = bool(text)
-    has_i = image is not None
-    if has_t and has_i:
-        return (text, image)
-    if has_t:
-        return text
-    if has_i:
-        return image
-    return None
 
 
 def _to_list(emb: Any) -> list[float]:
@@ -140,16 +90,11 @@ def _to_list(emb: Any) -> list[float]:
         return emb.tolist()
     if hasattr(emb, "tolist"):
         out = emb.tolist()
-        # Nested row from encode_* batch dim.
+        # Nested row from batch dim.
         if out and isinstance(out[0], list):
             return list(out[0])
         return list(out)
     return list(emb)
-
-
-# ---------------------------------------------------------------------------
-# MegaLoc preprocessing + inference
-# ---------------------------------------------------------------------------
 
 
 def image_to_megaloc_tensor(
@@ -179,12 +124,11 @@ def image_to_megaloc_tensor(
 
 
 class ModelWorker:
-    """Background thread that owns the model and runs one job at a time."""
+    """Background thread that owns MegaLoc and runs one job at a time."""
 
     def __init__(self, state):
         self.state = state
         self.settings = get_settings()
-        self.backend = (self.settings.model_backend or "megaloc").strip().lower()
         self.jobs: queue.Queue[ModelJob] = queue.Queue()
         self.results: queue.Queue[ModelResult] = queue.Queue()
         self._query_jobs: queue.Queue[QueryJob] = queue.Queue()
@@ -207,7 +151,7 @@ class ModelWorker:
         # Unblock queues so the loop can exit.
         try:
             self.jobs.put_nowait(
-                ModelJob(record_id="__stop__", text=None, image=None)
+                ModelJob(record_id="__stop__", image=b"")
             )
         except Exception:
             pass
@@ -216,13 +160,9 @@ class ModelWorker:
 
     def _run(self) -> None:
         try:
-            self.model = self._load_model()
+            self.model = self._load_megaloc()
             self.state.set_model_state("ready")
-            logger.info(
-                "Model ready backend=%s device=%s",
-                self.backend,
-                self.device,
-            )
+            logger.info("Model ready backend=megaloc device=%s", self.device)
         except Exception as e:
             logger.exception("Model load failed")
             self.state.set_model_state("error", str(e))
@@ -248,18 +188,8 @@ class ModelWorker:
 
     # -- loading -------------------------------------------------------------
 
-    def _load_model(self):
-        backend = self.backend
-        if backend in ("megaloc", "vpr"):
-            return self._load_megaloc()
-        if backend in ("jina", "sentence-transformers", "st"):
-            return self._load_jina()
-        raise ValueError(
-            f"unknown model_backend={backend!r}; expected megaloc|jina"
-        )
-
     def _load_megaloc(self):
-        """Load MegaLoc via torch.hub (raw torch, not SentenceTransformer)."""
+        """Load MegaLoc via torch.hub (raw torch)."""
         s = self.settings
         device = s.device
         logger.info(
@@ -291,45 +221,12 @@ class ModelWorker:
         )
         return model
 
-    def _load_jina(self):
-        """Load the Jina SentenceTransformer (kept for MODEL_BACKEND=jina)."""
-        from sentence_transformers import SentenceTransformer
-
-        s = self.settings
-        logger.info(
-            "Loading Jina model=%s device=%s modalities=%s",
-            s.model,
-            s.device,
-            s.modalities,
-        )
-        t0 = time.perf_counter()
-        model = SentenceTransformer(
-            s.model,
-            trust_remote_code=True,
-            device=s.device,
-            model_kwargs={"modality": s.modalities},
-        )
-        logger.info(
-            "Jina loaded on %s (%.1fs)",
-            s.device,
-            time.perf_counter() - t0,
-        )
-        return model
-
     # -- encode helpers ------------------------------------------------------
 
     def _require_ready(self) -> None:
         if not self.state.model_ready() or self.model is None:
             err = self.state.model_error or "model not ready"
             raise ModelNotReadyError(err)
-
-    def _require_backend(self, *allowed: str) -> None:
-        if self.backend not in allowed and not (
-            self.backend == "vpr" and "megaloc" in allowed
-        ):
-            raise BackendMismatchError(
-                f"backend is {self.backend!r}; this call needs one of {allowed}"
-            )
 
     def _vpr_encode_image(
         self,
@@ -350,53 +247,30 @@ class ModelWorker:
             desc = self.model(tensor)
         return _to_list(desc)
 
-    def _jina_encode(
-        self,
-        text: str | None,
-        image: Image.Image | bytes | str | None,
-        *,
-        query: bool,
-        normalize: bool = False,
-    ) -> list[float]:
-        value = _fused_input(text, image)
-        if value is None:
-            raise QueryError("no text or image to encode")
-        if query:
-            emb = self.model.encode_query(value, normalize_embeddings=normalize)
-        else:
-            emb = self.model.encode_document(value, normalize_embeddings=normalize)
-        return _to_list(emb)
-
     # -- job handlers --------------------------------------------------------
 
     def _handle_job(self, job: ModelJob) -> None:
         rid = job.record_id
         t0 = time.perf_counter()
         try:
-            if self.backend in ("megaloc", "vpr"):
-                if job.image is None:
-                    raise QueryError("VPR job requires an image")
-                if isinstance(job.image, str):
-                    raise QueryError(
-                        "VPR job image must be PIL or bytes (got path/url string)"
-                    )
-                emb = self._vpr_encode_image(job.image, transform=job.transform)
-            else:
-                emb = self._jina_encode(
-                    job.text, job.image, query=False, normalize=False
+            if job.image is None:
+                raise QueryError("VPR job requires an image")
+            if isinstance(job.image, str):
+                raise QueryError(
+                    "VPR job image must be PIL or bytes (got path/url string)"
                 )
+            emb = self._vpr_encode_image(job.image, transform=job.transform)
             self.results.put(
                 ModelResult(
                     record_id=rid,
                     embedding=emb,
-                    version=job.version,
+                    image_hash=job.image_hash,
                 )
             )
             logger.info(
-                "Job done %s dim=%d backend=%s (%.0fms)",
+                "Job done %s dim=%d (%.0fms)",
                 rid,
                 len(emb),
-                self.backend,
                 (time.perf_counter() - t0) * 1000,
             )
         except Exception as e:
@@ -406,33 +280,24 @@ class ModelWorker:
                     record_id=rid,
                     embedding=None,
                     error=str(e),
-                    version=job.version,
+                    image_hash=job.image_hash,
                 )
             )
 
     def _handle_query(self, job: QueryJob) -> None:
         t0 = time.perf_counter()
         try:
-            if self.backend in ("megaloc", "vpr"):
-                if job.image is None:
-                    raise QueryError("VPR encode requires an image")
-                if isinstance(job.image, str):
-                    raise QueryError(
-                        "VPR encode image must be PIL or bytes (got path/url string)"
-                    )
-                emb = self._vpr_encode_image(job.image, transform=job.transform)
-            else:
-                emb = self._jina_encode(
-                    job.text,
-                    job.image,
-                    query=True,
-                    normalize=job.normalize,
+            if job.image is None:
+                raise QueryError("VPR encode requires an image")
+            if isinstance(job.image, str):
+                raise QueryError(
+                    "VPR encode image must be PIL or bytes (got path/url string)"
                 )
+            emb = self._vpr_encode_image(job.image, transform=job.transform)
             job.result = emb
             logger.info(
-                "Query done dim=%d backend=%s (%.0fms)",
+                "Query done dim=%d (%.0fms)",
                 len(emb),
-                self.backend,
                 (time.perf_counter() - t0) * 1000,
             )
         except Exception as e:
@@ -445,22 +310,18 @@ class ModelWorker:
 
     # -- public API ----------------------------------------------------------
 
-    def encode_query(
+    def encode_vpr(
         self,
-        text: str | None,
-        image: Image.Image | bytes | str | None,
+        image: Image.Image | bytes,
         timeout: float = 0.0,
         *,
-        normalize: bool = False,
         transform: str | None = None,
     ) -> list[float]:
-        """Block until the worker encodes a query. Raises on failure/timeout."""
+        """Block until the worker encodes an image. Raises on failure/timeout."""
         self._require_ready()
         cond = threading.Condition()
         job = QueryJob(
-            text=text,
             image=image,
-            normalize=normalize,
             transform=transform,
             done=cond,
         )
@@ -480,20 +341,3 @@ class ModelWorker:
         if job.result is None:
             raise QueryError("empty query result")
         return job.result
-
-    def encode_vpr(
-        self,
-        image: Image.Image | bytes,
-        timeout: float = 0.0,
-        *,
-        transform: str | None = None,
-    ) -> list[float]:
-        """Image-only MegaLoc descriptor. Requires megaloc backend."""
-        self._require_ready()
-        self._require_backend("megaloc", "vpr")
-        return self.encode_query(
-            text=None,
-            image=image,
-            timeout=timeout,
-            transform=transform,
-        )

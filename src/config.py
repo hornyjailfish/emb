@@ -19,16 +19,11 @@ def check_cuda():
 
 class Settings(BaseSettings):
     fastapi_port: int
-    # Active model backend on the single worker thread. Only one loads at a
-    # time — megaloc (VPR, torch.hub) or jina (text+image SentenceTransformer).
-    # Env: MODEL_BACKEND
-    model_backend: str = "megaloc"
-    # Jina (kept; used when model_backend=jina).
-    model: str = "jinaai/jina-embeddings-v5-omni-nano-retrieval"
-    modalities: str = "vision"
     # MegaLoc hub entry (torch.hub.load). Env: MEGALOC_REPO / MEGALOC_ENTRY
     megaloc_repo: str = "gmberton/MegaLoc"
     megaloc_entry: str = "get_trained_model"
+    # Label written to embeddings.model on UPSERT.
+    megaloc_model_label: str = "gmberton/MegaLoc"
     # VPR geometry. Default matches MegaLoc eval (322x322 squash).
     # Env: VPR_IMAGE_SIZE / VPR_TRANSFORM
     vpr_image_size: int = 322
@@ -38,16 +33,12 @@ class Settings(BaseSettings):
     # Seconds to wait for a query encode. 0 / negative = no timeout (debug).
     # Env: QUERY_TIMEOUT
     query_timeout: float = 0.0
-    # Downscale images to at most this many pixels (aspect ratio kept) before
-    # encoding. 262144 px (~512x512) yields the model's 256-vision-token floor
-    # (its range is 256-1280 tokens), minimising CPU inference cost per image.
-    # Used by the Jina path only.
-    image_max_pixels: int = 262144
-    # Skip image downscaling entirely and pass raw bytes to the model (it
-    # accepts bytes directly). Env: DISABLE_IMAGE_TRANSFORM. Jina path only.
-    disable_image_transform: bool = False
     # Maximum records waiting in the dispatch queue (0 = unbounded).
     queue_capacity: int = 0
+    # How often to pull embedding_queue status=pending rows (seconds).
+    # 0 disables DB polling — only POST /generate feeds work.
+    # Env: QUEUE_POLL_INTERVAL
+    queue_poll_interval: float = 2.0
 
     surrealdb_host: str
     surrealdb_user: str

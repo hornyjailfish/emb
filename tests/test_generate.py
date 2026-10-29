@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import unittest
-from unittest import mock
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from surrealdb import RecordID
 
 import src.main as main
 from src.state import ServiceState
@@ -17,7 +15,6 @@ from src.state import ServiceState
 class GenerateBatchTests(unittest.TestCase):
     def setUp(self) -> None:
         # Isolate global queue/state/broadcaster between tests.
-        main.job_queue = asyncio.Queue(maxsize=100)
         main.vpr_queue = asyncio.Queue(maxsize=100)
         main.state = ServiceState()
         main.broadcaster.reset()
@@ -28,26 +25,14 @@ class GenerateBatchTests(unittest.TestCase):
             "/generate", main.generate, methods=["POST"], status_code=202
         )
         self.app.add_api_route(
-            "/jina/generate",
-            main.jina_generate,
-            methods=["POST"],
-            status_code=202,
-        )
-        self.app.add_api_route(
             "/vpr/generate",
             main.vpr_generate,
             methods=["POST"],
             status_code=202,
         )
         self.client = TestClient(self.app)
-        self._jina = mock.patch.object(main, "_is_jina", return_value=True)
-        self._mega = mock.patch.object(main, "_is_megaloc", return_value=False)
-        self._jina.start()
-        self._mega.start()
 
     def tearDown(self) -> None:
-        self._jina.stop()
-        self._mega.stop()
         main.broadcaster.close()
         main.broadcaster.reset()
 
@@ -60,21 +45,20 @@ class GenerateBatchTests(unittest.TestCase):
         body = resp.json()
         self.assertEqual(body["count"], 3)
         self.assertEqual(body["accepted"], items)
-        self.assertEqual(body["backend"], "jina")
+        self.assertEqual(body["backend"], "megaloc")
 
-        # All three landed on the dispatch queue as RecordIDs.
+        # All three landed on the VPR queue.
         queued = []
-        while not main.job_queue.empty():
-            queued.append(main.job_queue.get_nowait())
-        self.assertEqual([str(r) for r in queued], items)
-        self.assertTrue(all(isinstance(r, RecordID) for r in queued))
+        while not main.vpr_queue.empty():
+            queued.append(main.vpr_queue.get_nowait())
+        self.assertEqual([item.task_id for item in queued], items)
 
         # One SSE "queued" event per item, in order.
         events = [q.get_nowait() for _ in items]
         self.assertEqual(
             events,
             [
-                {"record_id": rid, "status": "queued", "kind": "jina"}
+                {"record_id": rid, "status": "queued", "kind": "vpr"}
                 for rid in items
             ],
         )
@@ -85,21 +69,32 @@ class GenerateBatchTests(unittest.TestCase):
 
         main.broadcaster.unsubscribe(q)
 
-    def test_jina_alias_queues(self) -> None:
+    def test_vpr_alias_queues(self) -> None:
         resp = self.client.post(
-            "/jina/generate", json={"items": ["marker_views:x"]}
+            "/vpr/generate",
+            json={"items": [{"id": "free-1", "image_url": "data:image/png;base64,AAAA"}]},
         )
         self.assertEqual(resp.status_code, 202)
-        self.assertEqual(resp.json()["backend"], "jina")
+        self.assertEqual(resp.json()["backend"], "megaloc")
+        item = main.vpr_queue.get_nowait()
+        self.assertEqual(item.task_id, "free-1")
+        self.assertTrue(item.image_url)
+
+    def test_freeform_requires_image_url(self) -> None:
+        resp = self.client.post("/generate", json={"items": ["not_a_view:1"]})
+        self.assertEqual(resp.status_code, 422)
 
     def test_rejects_empty_items(self) -> None:
         resp = self.client.post("/generate", json={"items": []})
         self.assertEqual(resp.status_code, 400)
 
-    def test_rejects_invalid_id_before_queueing(self) -> None:
-        resp = self.client.post("/generate", json={"items": ["not a record"]})
+    def test_rejects_invalid_marker_views_id_before_queueing(self) -> None:
+        # Bare strings that look like marker_views still need a valid RecordID.
+        resp = self.client.post(
+            "/generate", json={"items": ["marker_views:"]}
+        )
         self.assertEqual(resp.status_code, 422)
-        self.assertTrue(main.job_queue.empty())
+        self.assertTrue(main.vpr_queue.empty())
 
 
 if __name__ == "__main__":

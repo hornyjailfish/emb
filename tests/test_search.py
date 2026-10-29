@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
+import math
 import unittest
 
 from surrealdb import RecordID
-
-import math
 
 from src.search import (
     VIEW_COUNT_ALPHA,
@@ -121,15 +120,15 @@ class FilterTests(unittest.TestCase):
         )
 
     def test_bind_level_filter(self) -> None:
-        clauses, params = bind_filters(self.target, {"level": "levels:ground"})
+        clauses, params = bind_filters(self.target, {"level": "basemap_floor:ground"})
         self.assertEqual(clauses, ["marker.level = $f_level"])
-        self.assertEqual(params["f_level"], RecordID.parse("levels:ground"))
+        self.assertEqual(params["f_level"], RecordID.parse("basemap_floor:ground"))
 
     def test_bind_numeric_level_id_as_int(self) -> None:
-        # DB stores levels:-1 with int id; string "-1" must not be used.
-        _, params = bind_filters(self.target, {"level": "levels:-1"})
+        # DB stores basemap_floor:-1 with int id; string "-1" must not be used.
+        _, params = bind_filters(self.target, {"level": "basemap_floor:-1"})
         rid = params["f_level"]
-        self.assertEqual(rid.table_name, "levels")
+        self.assertEqual(rid.table_name, "basemap_floor")
         self.assertEqual(rid.id, -1)
         self.assertIsInstance(rid.id, int)
 
@@ -144,50 +143,49 @@ class FilterTests(unittest.TestCase):
 
 class ParseFilterRecordIdTests(unittest.TestCase):
     def test_numeric_negative(self) -> None:
-        rid = _parse_filter_record_id("levels:-1")
+        rid = _parse_filter_record_id("basemap_floor:-1")
         self.assertEqual(rid.id, -1)
         self.assertIsInstance(rid.id, int)
 
     def test_numeric_positive(self) -> None:
-        rid = _parse_filter_record_id("levels:3")
+        rid = _parse_filter_record_id("basemap_floor:3")
         self.assertEqual(rid.id, 3)
 
     def test_string_id_unchanged(self) -> None:
-        rid = _parse_filter_record_id("levels:lobby")
+        rid = _parse_filter_record_id("basemap_floor:lobby")
         self.assertEqual(rid.id, "lobby")
 
     def test_record_id_input_coerced(self) -> None:
-        rid = _parse_filter_record_id(RecordID("levels", "-1"))
+        rid = _parse_filter_record_id(RecordID("basemap_floor", "-1"))
         self.assertEqual(rid.id, -1)
 
 
 class QueryBuildTests(unittest.TestCase):
     def test_candidate_sql_includes_cosine_and_filters(self) -> None:
         target = get_target("markers")
-        clauses, _ = bind_filters(target, {"level": "levels:1"})
+        clauses, _ = bind_filters(target, {"level": "basemap_floor:1"})
         sql = build_candidate_query(
             target, filter_clauses=clauses, limit=40, min_score=0.55
         )
-        self.assertIn(
-            "vector::similarity::cosine(embedding_jina, $query)", sql
-        )
+        self.assertIn("vector::similarity::cosine(embedding, $query)", sql)
         self.assertIn("FROM embeddings", sql)
         self.assertIn("data AS id", sql)
         self.assertIn("data.marker AS marker", sql)
         self.assertIn("data.marker.level = $f_level", sql)
         self.assertIn(
-            "vector::similarity::cosine(embedding_jina, $query) >= $min_score",
+            "vector::similarity::cosine(embedding, $query) >= $min_score",
             sql,
         )
         self.assertIn("ORDER BY score DESC", sql)
         self.assertIn("LIMIT 40", sql)
 
-    def test_vpr_target_uses_megaloc_field(self) -> None:
+    def test_vpr_alias_target_uses_same_field(self) -> None:
         target = get_target("markers_vpr")
         sql = build_candidate_query(
             target, filter_clauses=[], limit=5, min_score=None
         )
-        self.assertIn("embedding_megaloc", sql)
+        self.assertIn("embedding", sql)
+        self.assertNotIn("embedding_megaloc", sql)
         self.assertIn("FROM embeddings", sql)
 
     def test_candidate_limit_is_view_level_top_k(self) -> None:
@@ -200,17 +198,16 @@ class RegistryTests(unittest.TestCase):
     def test_markers_target_registered(self) -> None:
         t = get_target("markers")
         self.assertEqual(t.source_table, "embeddings")
-        self.assertEqual(t.embedding_field, "embedding_jina")
+        self.assertEqual(t.embedding_field, "embedding")
         self.assertEqual(t.parent_field, "marker")
         self.assertEqual(t.parent_expr, "data.marker")
         self.assertEqual(t.id_expr, "data")
-        self.assertEqual(t.query_backend, "jina")
+        self.assertEqual(t.parent_fields, ("level", "zone", "geometry", "label"))
         self.assertIn("level", [f.key for f in t.filters])
 
-    def test_markers_vpr_target_registered(self) -> None:
+    def test_markers_vpr_alias(self) -> None:
         t = get_target("markers_vpr")
-        self.assertEqual(t.embedding_field, "embedding_megaloc")
-        self.assertEqual(t.query_backend, "megaloc")
+        self.assertEqual(t.embedding_field, "embedding")
 
     def test_unknown_target(self) -> None:
         with self.assertRaises(KeyError):
@@ -219,13 +216,13 @@ class RegistryTests(unittest.TestCase):
 
 class UnwrapTests(unittest.TestCase):
     def test_nested_statement_rows(self) -> None:
-        raw = [[{ "id": "a", "score": 1.0 }, { "id": "b", "score": 0.5 }]]
+        raw = [[{"id": "a", "score": 1.0}, {"id": "b", "score": 0.5}]]
         rows = unwrap_query_result(raw)
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["id"], "a")
 
     def test_flat_list_passthrough(self) -> None:
-        raw = [{ "id": "a" }]
+        raw = [{"id": "a"}]
         self.assertEqual(unwrap_query_result(raw), raw)
 
     def test_single_dict(self) -> None:

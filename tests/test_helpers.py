@@ -1,7 +1,7 @@
 """Synthetic tests for pure helpers (no DB, no model).
 
-Covers `_to_list` / `_normalize` (worker) and the URL/segment/record-id helpers
-from main. None of these touch SurrealDB or load the model.
+Covers URL/segment/record-id helpers from main. None of these touch SurrealDB
+or load the model.
 """
 
 import unittest
@@ -15,17 +15,18 @@ from src.main import (
     _build_proxy_url,
     _decode_base64_image,
     _image_ref_log,
+    _marker_views_key_from_queue_row,
     _parse_record_id,
     _queue_rid,
     _safe_literal_segment,
     settings,
 )
-from src.worker import _normalize, _to_list, prepare_image
+from src.worker import _to_list
 
 
 class ToListTests(unittest.TestCase):
-    def test_none_is_none(self):
-        self.assertIsNone(_to_list(None))
+    def test_none_is_empty(self):
+        self.assertEqual(_to_list(None), [])
 
     def test_list_becomes_floats(self):
         self.assertEqual(_to_list([1, 2, 3]), [1.0, 2.0, 3.0])
@@ -36,17 +37,6 @@ class ToListTests(unittest.TestCase):
                 return [1, 2, 3]
 
         self.assertEqual(_to_list(Vec()), [1.0, 2.0, 3.0])
-
-
-class NormalizeTests(unittest.TestCase):
-    def test_none_is_none(self):
-        self.assertIsNone(_normalize(None))
-
-    def test_unit_length(self):
-        self.assertEqual(_normalize([3.0, 4.0]), [0.6, 0.8])
-
-    def test_zero_norm_unchanged(self):
-        self.assertEqual(_normalize([0.0, 0.0]), [0.0, 0.0])
 
 
 class BuildProxyUrlTests(unittest.TestCase):
@@ -170,29 +160,18 @@ class QueueRidTests(unittest.TestCase):
                 self.assertEqual(q.id, "1yhf83tq1chseep1ts1s")
 
 
-class PrepareImageTests(unittest.TestCase):
-    def _png_bytes(self, w, h):
-        import io
+class QueueRowKeyTests(unittest.TestCase):
+    def test_from_data_field(self):
+        key = _marker_views_key_from_queue_row(
+            {"id": RecordID("embedding_queue", "abc"), "data": RecordID("marker_views", "abc")}
+        )
+        self.assertEqual(key, "marker_views:abc")
 
-        from PIL import Image
-
-        buf = io.BytesIO()
-        Image.new("RGB", (w, h), (200, 100, 50)).save(buf, format="PNG")
-        return buf.getvalue()
-
-    def test_small_image_unchanged(self):
-        img = prepare_image(self._png_bytes(100, 80), max_pixels=262144)
-        self.assertEqual(img.size, (100, 80))
-
-    def test_large_image_downscaled_keeping_aspect(self):
-        img = prepare_image(self._png_bytes(2000, 1000), max_pixels=262144)
-        w, h = img.size
-        self.assertLessEqual(w * h, 262144)
-        self.assertAlmostEqual(w / h, 2.0, delta=0.05)
-
-    def test_no_upscale(self):
-        img = prepare_image(self._png_bytes(50, 40), max_pixels=262144)
-        self.assertEqual(img.size, (50, 40))
+    def test_from_queue_id_fallback(self):
+        key = _marker_views_key_from_queue_row(
+            {"id": RecordID("embedding_queue", "xyz")}
+        )
+        self.assertEqual(key, "marker_views:xyz")
 
 
 class Base64ImageTests(unittest.TestCase):
@@ -216,14 +195,6 @@ class Base64ImageTests(unittest.TestCase):
         self.assertEqual(
             _decode_base64_image(f"data:image/png;base64,{b64}"), raw
         )
-
-    def test_same_prep_as_generate(self):
-        """Search/encode base64 must hit the same downscale as generate."""
-        raw, b64 = self._png_b64(2000, 1000)
-        decoded = _decode_base64_image(b64)
-        assert decoded is not None
-        img = prepare_image(decoded, settings.image_max_pixels)
-        self.assertLessEqual(img.size[0] * img.size[1], settings.image_max_pixels)
 
     def test_log_never_dumps_body(self):
         _, b64 = self._png_b64()

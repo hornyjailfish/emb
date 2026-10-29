@@ -4,12 +4,16 @@ from importlib import util
 
 logger = logging.getLogger(__name__)
 
-# Core always required. Backend-specific libs are checked in check_deps()
-# against Settings.model_backend so Jina-only hosts need not install MegaLoc
-# extras and vice versa.
-REQUIRED_LIBS = ["torch", "fastapi", "surrealdb", "pydantic", "numpy"]
-JINA_LIBS = ["sentence_transformers"]
-MEGALOC_LIBS = ["torchvision", "huggingface_hub", "safetensors"]
+REQUIRED_LIBS = [
+    "torch",
+    "torchvision",
+    "fastapi",
+    "surrealdb",
+    "pydantic",
+    "numpy",
+    "huggingface_hub",
+    "safetensors",
+]
 OPTIONAL_LIBS = ["win32api", "win32con", "win32process"]
 UTILITY_LIBS = ["colorlog"]
 
@@ -17,9 +21,10 @@ missing_libs = [lib for lib in REQUIRED_LIBS if util.find_spec(lib) is None]
 missing_optional_libs = [lib for lib in OPTIONAL_LIBS if util.find_spec(lib) is None]
 missing_utility_libs = [lib for lib in UTILITY_LIBS if util.find_spec(lib) is None]
 
+
 def quiet_third_party_loggers():
     """Silence INFO/DEBUG chatter from HTTP and model-download libraries."""
-    for noisy in ("httpx", "httpcore", "urllib3", "huggingface_hub", "transformers"):
+    for noisy in ("httpx", "httpcore", "urllib3", "huggingface_hub"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
@@ -46,6 +51,7 @@ def setup_logging(log_level):
     root_logger.setLevel(log_level)
     quiet_third_party_loggers()
 
+
 def setup_process_prio():
     if set(missing_optional_libs) & {"win32api", "win32con", "win32process"}:
         return
@@ -67,34 +73,13 @@ def setup_process_prio():
         win32process.SetPriorityClass(handle, priority)
         logger.info(f"Системный приоритет процесса успeшно установлен {label[priority]}.")
 
+
 def check_deps():
     if missing_libs:
         logger.critical("Отсутствуют обязательные зависимости!")
         for lib in missing_libs:
             logger.error(f"  - {lib} не установлена\n")
         logger.info("\nУстановите их командой: pip install " + " ".join(missing_libs))
-        sys.exit(1)
-
-    # Backend-specific imports — resolve settings lazily (needs .env).
-    backend = "megaloc"
-    try:
-        from src.config import get_settings
-
-        backend = (get_settings().model_backend or "megaloc").strip().lower()
-    except Exception as e:
-        logger.warning("Could not read model_backend for dep check: %s", e)
-
-    extra = MEGALOC_LIBS if backend in ("megaloc", "vpr") else JINA_LIBS
-    missing_backend = [lib for lib in extra if util.find_spec(lib) is None]
-    if missing_backend:
-        logger.critical(
-            "Отсутствуют зависимости для model_backend=%s!", backend
-        )
-        for lib in missing_backend:
-            logger.error(f"  - {lib} не установлена\n")
-        logger.info(
-            "\nУстановите их командой: pip install " + " ".join(missing_backend)
-        )
         sys.exit(1)
 
     if missing_optional_libs:

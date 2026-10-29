@@ -9,8 +9,6 @@ torchvision
 # MegaLoc (torch.hub) weight download + load
 huggingface_hub
 safetensors
-# Jina backend (MODEL_BACKEND=jina) — optional at runtime if only MegaLoc is used
-sentence-transformers
 numpy
 # SurrealDB v3 file pointers (CBOR tag 55 / File / db.files) need the 3.x SDK.
 surrealdb>=3.0.0b10
